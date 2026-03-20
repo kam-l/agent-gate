@@ -36,6 +36,23 @@ try {
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId);
   const lastMessage = data.last_assistant_message || "";
 
+  // Hardcoded gater fallback: record verdict from message when no artifact found.
+  // The gater agent definition lives in the plugin's agents/ dir (not .claude/agents/),
+  // so findAgentMd won't find it. Extract verdict directly from last_assistant_message
+  // and write to session_scopes — plan-gate reads these to allow ExitPlanMode.
+  if (agentType === "gater" && lastMessage) {
+    const gaterVerdict = VERDICT_RE.exec(lastMessage);
+    if (gaterVerdict) {
+      const db = gatesDb.getDb(sessionDir);
+      try {
+        recordVerdict(sessionDir, "gater-review", agentType, gaterVerdict[1], db);
+      } finally {
+        if (db) try { db.close(); } catch {}
+      }
+    }
+    process.exit(0);
+  }
+
   // Find agent definition
   const agentMdPath = findAgentMd(agentType, PROJECT_ROOT, HOME);
   if (!agentMdPath) process.exit(0);

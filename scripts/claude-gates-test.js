@@ -1603,6 +1603,121 @@ assert(!iter3.stdout.includes("block"), "attempt 3 auto-allows");
 
 fs.rmSync(tmpIterHome, { recursive: true, force: true });
 
+// ── gater fallback verdict recording ─────────────────────────────────
+
+describe("gater fallback verdict recording (no artifact)");
+
+const verificationScript = path.join(__dirname, "claude-gates-verification.js");
+
+function runVerification(payload, env) {
+  try {
+    const result = execSync(`node "${verificationScript}"`, {
+      input: JSON.stringify(payload),
+      encoding: "utf-8",
+      timeout: 10000,
+      cwd: PLUGIN_ROOT,
+      env: { ...process.env, CLAUDECODE: "", ...env }
+    });
+    return { stdout: result, stderr: "", exitCode: 0 };
+  } catch (err) {
+    return { stdout: err.stdout || "", stderr: err.stderr || "", exitCode: err.status };
+  }
+}
+
+// Test: gater SubagentStop with Result: PASS in message → verdict recorded to session_scopes
+const tmpGaterHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gater-fb-"));
+const gaterSessionDir = path.join(tmpGaterHome, ".claude", "sessions", "gater-fb-test");
+fs.mkdirSync(gaterSessionDir, { recursive: true });
+
+const gaterResult = runVerification({
+  session_id: "gater-fb-test",
+  agent_type: "gater",
+  agent_id: "gater-1",
+  last_assistant_message: "Found 2 issues.\n\nResult: PASS"
+}, { USERPROFILE: tmpGaterHome, HOME: tmpGaterHome });
+
+assert(gaterResult.exitCode === 0, "gater fallback exits 0 (fail-open)");
+assert(!gaterResult.stdout.includes("block"), "gater fallback does not block");
+
+// Verify verdict was recorded
+const gfDb = gatesDb.getDb(gaterSessionDir);
+if (gfDb) {
+  const row = gfDb.prepare(
+    "SELECT verdict FROM cleared WHERE scope = 'gater-review' AND agent = 'gater'"
+  ).get();
+  assert(row && row.verdict === "PASS", "gater PASS verdict recorded in SQLite");
+  gfDb.close();
+} else {
+  try {
+    const scopes = JSON.parse(fs.readFileSync(path.join(gaterSessionDir, "session_scopes.json"), "utf-8"));
+    const entry = scopes["gater-review"] && scopes["gater-review"].cleared && scopes["gater-review"].cleared.gater;
+    assert(entry && entry.verdict === "PASS", "gater PASS verdict recorded in JSON");
+  } catch {
+    assert(false, "gater PASS verdict recorded (no scopes file found)");
+  }
+}
+
+// Test: gater with no Result: line → no verdict recorded
+const tmpGaterHome2 = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gater-fb2-"));
+const gaterSessionDir2 = path.join(tmpGaterHome2, ".claude", "sessions", "gater-fb2-test");
+fs.mkdirSync(gaterSessionDir2, { recursive: true });
+
+const gaterResult2 = runVerification({
+  session_id: "gater-fb2-test",
+  agent_type: "gater",
+  agent_id: "gater-2",
+  last_assistant_message: "I looked at everything and it seems fine."
+}, { USERPROFILE: tmpGaterHome2, HOME: tmpGaterHome2 });
+
+assert(gaterResult2.exitCode === 0, "gater no-verdict exits 0");
+
+const gf2Db = gatesDb.getDb(gaterSessionDir2);
+if (gf2Db) {
+  const row2 = gf2Db.prepare(
+    "SELECT verdict FROM cleared WHERE scope = 'gater-review' AND agent = 'gater'"
+  ).get();
+  assert(!row2, "no verdict recorded when message lacks Result: line");
+  gf2Db.close();
+} else {
+  const scopesExists = fs.existsSync(path.join(gaterSessionDir2, "session_scopes.json"));
+  assert(!scopesExists, "no verdict recorded when message lacks Result: line (JSON)");
+}
+
+// Test: gater with CONVERGED → verdict recorded as CONVERGED
+const tmpGaterHome3 = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gater-fb3-"));
+const gaterSessionDir3 = path.join(tmpGaterHome3, ".claude", "sessions", "gater-fb3-test");
+fs.mkdirSync(gaterSessionDir3, { recursive: true });
+
+const gaterResult3 = runVerification({
+  session_id: "gater-fb3-test",
+  agent_type: "gater",
+  agent_id: "gater-3",
+  last_assistant_message: "No new issues found.\n\nResult: CONVERGED"
+}, { USERPROFILE: tmpGaterHome3, HOME: tmpGaterHome3 });
+
+assert(gaterResult3.exitCode === 0, "gater CONVERGED exits 0");
+
+const gf3Db = gatesDb.getDb(gaterSessionDir3);
+if (gf3Db) {
+  const row3 = gf3Db.prepare(
+    "SELECT verdict FROM cleared WHERE scope = 'gater-review' AND agent = 'gater'"
+  ).get();
+  assert(row3 && row3.verdict === "CONVERGED", "gater CONVERGED verdict recorded");
+  gf3Db.close();
+} else {
+  try {
+    const scopes3 = JSON.parse(fs.readFileSync(path.join(gaterSessionDir3, "session_scopes.json"), "utf-8"));
+    const entry3 = scopes3["gater-review"] && scopes3["gater-review"].cleared && scopes3["gater-review"].cleared.gater;
+    assert(entry3 && entry3.verdict === "CONVERGED", "gater CONVERGED verdict recorded (JSON)");
+  } catch {
+    assert(false, "gater CONVERGED verdict recorded (no scopes file found)");
+  }
+}
+
+fs.rmSync(tmpGaterHome, { recursive: true, force: true });
+fs.rmSync(tmpGaterHome2, { recursive: true, force: true });
+fs.rmSync(tmpGaterHome3, { recursive: true, force: true });
+
 // ── Summary ─────────────────────────────────────────────────────────
 
 console.log(`\n${"=".repeat(50)}`);

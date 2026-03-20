@@ -30,7 +30,7 @@ Declarative pipeline gates — `requires:`, `verification:`, `conditions:`, and 
 - `claude-gates-config.js` — Project-level config loader. Reads `claude-gates.json`, merges with defaults, caches per process.
 - `claude-gates-conditions.js` — PreToolUse:Agent. Checks `requires:`, `conditions:` (semantic pre-check), enforces `gates:` chain ordering, blocks missing scope for CG agents. Registers scope+cleared+pending atomically.
 - `claude-gates-injection.js` — SubagentStart. Reads pending, injects `output_filepath`. Enhances context for gate agents with `role=gate` and source artifact info.
-- `claude-gates-verification.js` — SubagentStop. Two-layer verification (or gates-only structural check), verdict recording, gate state machine transitions.
+- `claude-gates-verification.js` — SubagentStop. Two-layer verification (or gates-only structural check), verdict recording, gate state machine transitions. Hardcoded gater fallback: records verdict from `last_assistant_message` when no artifact file found (feeds plan-gate).
 - `plan-gate.js` — PreToolUse:ExitPlanMode. Verdict-based: checks session_scopes for gater PASS/CONVERGED. Auto-allows after 3 attempts.
 - `commit-gate.js` — PreToolUse:Bash. Detects `git commit`, runs configured validation commands. Opt-in via `claude-gates.json`.
 - `edit-gate.js` — PostToolUse:Edit|Write. Tracks edited files + git line stats. Configurable thresholds (default: 10 files / 200 lines).
