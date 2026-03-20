@@ -2,7 +2,10 @@
 /**
  * ClaudeGates v2 — Stop gate.
  *
- * Scans edit-gate's file list for debug leftovers.
+ * 1. Artifact completeness: warns about agents with no verdict or REVISE verdict
+ *    in scopes where other agents have completed (PASS/CONVERGED).
+ * 2. Debug leftovers: scans edit-gate's file list for common debug markers.
+ *
  * Once-only nudge: blocks first time, passes on second stop.
  *
  * Fail-open.
@@ -11,6 +14,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
+const { getDb, hasMarker, getEdits, setMarker } = require("./claude-gates-db.js");
 
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -20,22 +24,88 @@ try {
 
   const HOME = process.env.USERPROFILE || process.env.HOME || "";
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId);
-  const logFile = path.join(sessionDir, "edits.log");
-  const markerFile = path.join(sessionDir, ".stop-gate-nudged");
 
-  // Already nudged → pass through
-  if (fs.existsSync(markerFile)) process.exit(0);
+  // Dual-path: SQLite or JSON
+  const db = getDb(sessionDir);
+  let files;
+  const issues = [];
 
-  // No edits.log → nothing to check
-  if (!fs.existsSync(logFile)) process.exit(0);
+  if (db) {
+    // SQLite path
+    if (hasMarker(db, "stop-gate-nudged")) { db.close(); process.exit(0); }
 
-  const files = fs.readFileSync(logFile, "utf-8")
-    .split("\n")
-    .map(l => l.trim())
-    .filter(Boolean);
+    // ── Artifact completeness check ──
+    try {
+      const incomplete = db.prepare(
+        "SELECT scope, agent FROM cleared WHERE verdict IS NULL OR verdict = 'REVISE'"
+      ).all();
 
-  if (files.length === 0) process.exit(0);
+      for (const row of incomplete) {
+        // Check if scope is active (has at least one PASS/CONVERGED agent)
+        const active = db.prepare(
+          "SELECT 1 FROM cleared WHERE scope = ? AND verdict IN ('PASS','CONVERGED') LIMIT 1"
+        ).get(row.scope);
 
+        if (!active) continue; // scope abandoned or not started — skip
+
+        // Check if artifact file exists
+        const artifactPath = path.join(sessionDir, row.scope, row.agent + ".md");
+        if (!fs.existsSync(artifactPath)) {
+          issues.push(`  ${row.scope}/${row.agent}: missing artifact (verdict: ${row.verdict || "none"})`);
+        }
+      }
+    } catch {} // non-fatal
+
+    files = getEdits(db);
+    if (files.length === 0 && issues.length === 0) { db.close(); process.exit(0); }
+  } else {
+    // JSON path
+    const logFile = path.join(sessionDir, "edits.log");
+    const markerFile = path.join(sessionDir, ".stop-gate-nudged");
+
+    if (fs.existsSync(markerFile)) process.exit(0);
+
+    // JSON artifact completeness check
+    try {
+      const scopesFile = path.join(sessionDir, "session_scopes.json");
+      if (fs.existsSync(scopesFile)) {
+        const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
+        for (const [scope, info] of Object.entries(scopes)) {
+          if (scope === "_pending" || !info || !info.cleared) continue;
+          const cleared = info.cleared;
+          const hasCompleted = Object.values(cleared).some(v =>
+            v && typeof v === "object" && (v.verdict === "PASS" || v.verdict === "CONVERGED")
+          );
+          if (!hasCompleted) continue;
+
+          for (const [agent, val] of Object.entries(cleared)) {
+            const verdict = (val && typeof val === "object") ? val.verdict : null;
+            if (verdict === null || verdict === "REVISE") {
+              const artifactPath = path.join(sessionDir, scope, agent + ".md");
+              if (!fs.existsSync(artifactPath)) {
+                issues.push(`  ${scope}/${agent}: missing artifact (verdict: ${verdict || "none"})`);
+              }
+            }
+          }
+        }
+      }
+    } catch {} // non-fatal
+
+    if (!fs.existsSync(logFile) && issues.length === 0) process.exit(0);
+
+    try {
+      files = fs.readFileSync(logFile, "utf-8")
+        .split("\n")
+        .map(l => l.trim())
+        .filter(Boolean);
+    } catch {
+      files = [];
+    }
+
+    if (files.length === 0 && issues.length === 0) process.exit(0);
+  }
+
+  // ── Debug leftover scan ──
   const PATTERNS = [
     { name: "TODO", re: /\bTODO\b/ },
     { name: "HACK", re: /\bHACK\b/ },
@@ -89,22 +159,40 @@ try {
     }
   }
 
-  if (matches.length === 0) process.exit(0);
+  if (matches.length === 0 && issues.length === 0) {
+    if (db) db.close();
+    process.exit(0);
+  }
 
   // Create marker so second stop passes
-  try {
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-    fs.writeFileSync(markerFile, new Date().toISOString(), "utf-8");
-  } catch {} // non-fatal
+  if (db) {
+    try { setMarker(db, "stop-gate-nudged", new Date().toISOString()); } catch {} // non-fatal
+    db.close();
+  } else {
+    try {
+      const markerFile = path.join(sessionDir, ".stop-gate-nudged");
+      if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(markerFile, new Date().toISOString(), "utf-8");
+    } catch {} // non-fatal
+  }
 
-  // Build summary (cap at 10 entries)
-  const summary = matches.slice(0, 10)
-    .map(m => `  ${m.file}: ${m.pattern} — ${m.line}`)
-    .join("\n");
+  // Build summary (cap at 10 entries each)
+  const parts = [];
+
+  if (issues.length > 0) {
+    parts.push(`Incomplete artifacts:\n${issues.slice(0, 10).join("\n")}`);
+  }
+
+  if (matches.length > 0) {
+    const debugSummary = matches.slice(0, 10)
+      .map(m => `  ${m.file}: ${m.pattern} — ${m.line}`)
+      .join("\n");
+    parts.push(`Debug leftovers found:\n${debugSummary}`);
+  }
 
   process.stdout.write(JSON.stringify({
     decision: "block",
-    reason: `[ClaudeGates] Debug leftovers found:\n${summary}\nClean up or stop again to proceed.`
+    reason: `[ClaudeGates] ${parts.join("\n")}\nClean up or stop again to proceed.`
   }));
   process.exit(0);
 } catch {

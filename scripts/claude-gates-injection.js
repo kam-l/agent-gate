@@ -11,6 +11,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { getDb, getPending } = require("./claude-gates-db.js");
 
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -23,16 +24,27 @@ try {
 
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId).replace(/\\/g, "/");
 
-  // Read output_filepath from _pending (staged by conditions hook)
+  // Read output_filepath from pending state (staged by conditions hook)
   let outputFilepath = "";
-  try {
-    const scopesFile = path.join(HOME, ".claude", "sessions", sessionId, "session_scopes.json");
-    const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
-    const pending = scopes._pending && scopes._pending[agentType];
+  const db = getDb(sessionDir);
+  if (db) {
+    // SQLite path
+    const pending = getPending(db, agentType);
     if (pending && pending.outputFilepath) {
       outputFilepath = pending.outputFilepath;
     }
-  } catch {} // missing or unreadable → no filepath injection
+    db.close();
+  } else {
+    // JSON path (existing behavior)
+    try {
+      const scopesFile = path.join(HOME, ".claude", "sessions", sessionId, "session_scopes.json");
+      const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
+      const pending = scopes._pending && scopes._pending[agentType];
+      if (pending && pending.outputFilepath) {
+        outputFilepath = pending.outputFilepath;
+      }
+    } catch {} // missing or unreadable → no filepath injection
+  }
 
   let context;
   if (outputFilepath) {

@@ -17,6 +17,7 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 const { parseVerification, parseOnRevise, parseMaxRounds, findAgentMd, VERDICT_RE } = require("./claude-gates-shared.js");
+const gatesDb = require("./claude-gates-db.js");
 
 const PROJECT_ROOT = process.cwd();
 const HOME = process.env.USERPROFILE || process.env.HOME || "";
@@ -45,42 +46,49 @@ try {
   // No verification prompt → no gate
   if (!verification) process.exit(0);
 
-  // ── Locate artifact ──
-  // Path 1: new schema — extract from last message
-  const artifactInfo = extractArtifactPath(lastMessage, sessionDir, agentType);
+  // Open DB (null if better-sqlite3 unavailable → JSON fallback)
+  const db = gatesDb.getDb(sessionDir);
 
-  if (artifactInfo) {
-    validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId, mdContent);
-    process.exit(0);
-  }
-
-  // Path 2: legacy — old gate: schema with .context/tasks/
   try {
-    const compat = require("./claude-gates-compat.js");
-    const legacyInfo = compat.extractLegacyArtifactPath(mdContent, PROJECT_ROOT);
-    if (legacyInfo) {
-      compat.runLegacyVerification(legacyInfo, verification, mdContent, data, PROJECT_ROOT, HOME, runSemanticCheck);
-      process.exit(0);
-    }
-  } catch {} // compat module missing → skip legacy path
+    // ── Locate artifact ──
+    // Path 1: new schema — extract from last message
+    const artifactInfo = extractArtifactPath(lastMessage, sessionDir, agentType);
 
-  // Path 3: scope lookup — agent was cleared but path not in message
-  const clearedScope = findClearedScope(sessionDir, agentType);
-  if (clearedScope) {
-    const expectedPath = path.join(sessionDir, clearedScope, `${agentType}.md`);
-    if (fs.existsSync(expectedPath)) {
-      runVerification(expectedPath, clearedScope, verification, sessionDir, agentType, agentId, mdContent);
+    if (artifactInfo) {
+      validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId, mdContent, db);
       process.exit(0);
     }
-    process.stdout.write(JSON.stringify({
-      decision: "block",
-      reason: `[ClaudeGates] Write your artifact to ${sessionDir.replace(/\\/g, "/")}/${clearedScope}/${agentType}.md before stopping. Include a Result: PASS or Result: FAIL line.`
-    }));
+
+    // Path 2: legacy — old gate: schema with .context/tasks/
+    try {
+      const compat = require("./claude-gates-compat.js");
+      const legacyInfo = compat.extractLegacyArtifactPath(mdContent, PROJECT_ROOT);
+      if (legacyInfo) {
+        compat.runLegacyVerification(legacyInfo, verification, mdContent, data, PROJECT_ROOT, HOME, runSemanticCheck);
+        process.exit(0);
+      }
+    } catch {} // compat module missing → skip legacy path
+
+    // Path 3: scope lookup — agent was cleared but path not in message
+    const clearedScope = findClearedScope(sessionDir, agentType, db);
+    if (clearedScope) {
+      const expectedPath = path.join(sessionDir, clearedScope, `${agentType}.md`);
+      if (fs.existsSync(expectedPath)) {
+        runVerification(expectedPath, clearedScope, verification, sessionDir, agentType, agentId, mdContent, db);
+        process.exit(0);
+      }
+      process.stdout.write(JSON.stringify({
+        decision: "block",
+        reason: `[ClaudeGates] Write your artifact to ${sessionDir.replace(/\\/g, "/")}/${clearedScope}/${agentType}.md before stopping. Include a Result: PASS or Result: FAIL line.`
+      }));
+      process.exit(0);
+    }
+
+    // No scope, no legacy match → fail-open (ungated usage)
     process.exit(0);
+  } finally {
+    if (db) try { db.close(); } catch {}
   }
-
-  // No scope, no legacy match → fail-open (ungated usage)
-  process.exit(0);
 } catch (err) {
   process.stderr.write(`[ClaudeGates verification] Error: ${err.message}\n`);
   process.exit(0); // fail-open
@@ -107,9 +115,14 @@ function extractArtifactPath(message, sessionDir, agentType) {
 }
 
 /**
- * Find which scope this agent was cleared for in session_scopes.json.
+ * Find which scope this agent was cleared for.
+ * Dual-path: SQLite if available, JSON fallback.
  */
-function findClearedScope(sessionDir, agentType) {
+function findClearedScope(sessionDir, agentType, db) {
+  if (db) {
+    return gatesDb.findClearedScope(db, agentType);
+  }
+  // JSON fallback
   try {
     const scopesFile = path.join(sessionDir, "session_scopes.json");
     const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
@@ -121,13 +134,27 @@ function findClearedScope(sessionDir, agentType) {
 }
 
 /**
- * Record a structured verdict object to session_scopes.json.
- * Re-reads the file fresh to minimize stale-data risk.
+ * Record a structured verdict object.
+ * Dual-path: SQLite (atomic) or JSON (read-modify-write fallback).
  * Returns { verdict, round, max, on_revise } or null on error.
  */
-function recordVerdict(sessionDir, scope, agentType, verdict, onRevise, maxRounds) {
+function recordVerdict(sessionDir, scope, agentType, verdict, onRevise, maxRounds, db) {
   if (!scope || !sessionDir) return null;
   try {
+    if (db) {
+      // SQLite path — atomic read + write
+      const existing = gatesDb.getCleared(db, scope, agentType);
+      const round = (existing && typeof existing === "object" && existing.round) ? existing.round + 1 : 1;
+
+      const verdictObj = { verdict, round };
+      if (maxRounds != null) verdictObj.max = maxRounds;
+      if (onRevise != null) verdictObj.on_revise = onRevise;
+
+      gatesDb.setCleared(db, scope, agentType, verdictObj);
+      return verdictObj;
+    }
+
+    // JSON fallback (existing behavior)
     const scopesFile = path.join(sessionDir, "session_scopes.json");
     let scopes = {};
     try {
@@ -159,22 +186,37 @@ function recordVerdict(sessionDir, scope, agentType, verdict, onRevise, maxRound
 /**
  * Validate scope registration then run verification.
  */
-function validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId, mdContent) {
+function validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId, mdContent, db) {
   const { artifactPath, scope } = artifactInfo;
 
-  // Validate scope against session_scopes.json
+  // Validate scope registration
   if (scope) {
-    try {
-      const scopes = JSON.parse(fs.readFileSync(path.join(sessionDir, "session_scopes.json"), "utf-8"));
-      if (!scopes[scope]) {
-        block(`Scope "${scope}" not registered. Were you spawned with scope=${scope}?`);
-        return;
-      }
-      if (!scopes[scope].cleared || !scopes[scope].cleared[agentType]) {
+    if (db) {
+      // SQLite path
+      if (!gatesDb.isCleared(db, scope, agentType)) {
+        // Check if scope exists at all
+        const scopeExists = db.prepare("SELECT 1 FROM scopes WHERE scope = ?").get(scope);
+        if (!scopeExists) {
+          block(`Scope "${scope}" not registered. Were you spawned with scope=${scope}?`);
+          return;
+        }
         block(`Agent "${agentType}" not cleared for scope "${scope}".`);
         return;
       }
-    } catch {} // missing scopes file → proceed (fail-open)
+    } else {
+      // JSON fallback
+      try {
+        const scopes = JSON.parse(fs.readFileSync(path.join(sessionDir, "session_scopes.json"), "utf-8"));
+        if (!scopes[scope]) {
+          block(`Scope "${scope}" not registered. Were you spawned with scope=${scope}?`);
+          return;
+        }
+        if (!scopes[scope].cleared || !scopes[scope].cleared[agentType]) {
+          block(`Agent "${agentType}" not cleared for scope "${scope}".`);
+          return;
+        }
+      } catch {} // missing scopes file → proceed (fail-open)
+    }
   }
 
   if (!fs.existsSync(artifactPath)) {
@@ -182,13 +224,13 @@ function validateScopeAndVerify(artifactInfo, verification, sessionDir, agentTyp
     return;
   }
 
-  runVerification(artifactPath, scope, verification, sessionDir, agentType, agentId, mdContent);
+  runVerification(artifactPath, scope, verification, sessionDir, agentType, agentId, mdContent, db);
 }
 
 /**
  * Layer 1 (deterministic) + Layer 2 (semantic) verification.
  */
-function runVerification(artifactPath, scope, verification, sessionDir, agentType, agentId, mdContent) {
+function runVerification(artifactPath, scope, verification, sessionDir, agentType, agentId, mdContent, db) {
   const artifactContent = fs.readFileSync(artifactPath, "utf-8");
 
   // Layer 1: Result: line must exist
@@ -212,7 +254,7 @@ function runVerification(artifactPath, scope, verification, sessionDir, agentTyp
   }
 
   // Layer 2: semantic verification
-  runSemanticCheck(verification, artifactContent, artifactPath, contextContent, agentType, agentId, null, scope, sessionDir, mdContent);
+  runSemanticCheck(verification, artifactContent, artifactPath, contextContent, agentType, agentId, null, scope, sessionDir, mdContent, db);
 }
 
 /**
@@ -226,7 +268,7 @@ function runVerification(artifactPath, scope, verification, sessionDir, agentTyp
  *
  * mdContent (last param) is optional — legacy compat path omits it.
  */
-function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent, agentType, agentId, sessionId, scope, sessionDir, mdContent) {
+function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent, agentType, agentId, sessionId, scope, sessionDir, mdContent, db) {
   const resolvedSessionDir = sessionDir || (sessionId ? path.join(HOME, ".claude", "sessions", sessionId) : null);
 
   let combinedPrompt = prompt + "\n\n";
@@ -298,7 +340,7 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
   // Record verdict to session_scopes.json
   const onRevise = parseOnRevise(mdContent);
   const maxRounds = parseMaxRounds(mdContent);
-  const verdictObj = recordVerdict(resolvedSessionDir, scope, agentType, finalVerdict, onRevise, maxRounds);
+  const verdictObj = recordVerdict(resolvedSessionDir, scope, agentType, finalVerdict, onRevise, maxRounds, db);
 
   if (verdictObj) {
     const maxStr = verdictObj.max ? `/${verdictObj.max}` : "";

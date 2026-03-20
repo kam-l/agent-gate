@@ -23,6 +23,7 @@
 const fs = require("fs");
 const path = require("path");
 const { parseRequires, findAgentMd } = require("./claude-gates-shared.js");
+const { getDb, registerScope } = require("./claude-gates-db.js");
 
 const HOME = process.env.USERPROFILE || process.env.HOME || "";
 const PROJECT_ROOT = process.cwd();
@@ -85,28 +86,37 @@ try {
     fs.mkdirSync(scopeDir, { recursive: true });
   }
 
-  // Register scope + cleared agent in session_scopes.json
-  const scopesFile = path.join(sessionDir, "session_scopes.json");
-  let scopes = {};
-  try {
-    scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
-  } catch {} // missing or invalid → start fresh
-
-  if (!scopes[scope]) scopes[scope] = { cleared: {} };
-  if (!scopes[scope].cleared[agentType]) {
-    scopes[scope].cleared[agentType] = true;
-  }
-
-  // Stage output_filepath for injection hook (SubagentStart reads this)
   const outputFilepath = path.join(scopeDir, `${agentType}.md`).replace(/\\/g, "/");
-  if (!scopes._pending) scopes._pending = {};
-  scopes._pending[agentType] = { scope, outputFilepath };
 
-  // Ensure session dir exists before writing
-  if (!fs.existsSync(sessionDir)) {
-    fs.mkdirSync(sessionDir, { recursive: true });
+  // Dual-path: SQLite (atomic) or JSON (fallback)
+  const db = getDb(sessionDir);
+  if (db) {
+    // SQLite path — single atomic transaction
+    registerScope(db, scope, agentType, outputFilepath);
+    db.close();
+  } else {
+    // JSON path (existing behavior)
+    const scopesFile = path.join(sessionDir, "session_scopes.json");
+    let scopes = {};
+    try {
+      scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
+    } catch {} // missing or invalid → start fresh
+
+    if (!scopes[scope]) scopes[scope] = { cleared: {} };
+    if (!scopes[scope].cleared[agentType]) {
+      scopes[scope].cleared[agentType] = true;
+    }
+
+    // Stage output_filepath for injection hook
+    if (!scopes._pending) scopes._pending = {};
+    scopes._pending[agentType] = { scope, outputFilepath };
+
+    // Ensure session dir exists before writing
+    if (!fs.existsSync(sessionDir)) {
+      fs.mkdirSync(sessionDir, { recursive: true });
+    }
+    fs.writeFileSync(scopesFile, JSON.stringify(scopes, null, 2), "utf-8");
   }
-  fs.writeFileSync(scopesFile, JSON.stringify(scopes, null, 2), "utf-8");
 
   // Allow
   process.exit(0);
