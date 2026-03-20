@@ -17,7 +17,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { getDb, hasMarker, getEdits, setMarker } = require("./claude-gates-db.js");
+const { getDb, getEdits, isCleared, registerAgent } = require("./claude-gates-db.js");
 const { loadConfig } = require("./claude-gates-config.js");
 
 try {
@@ -36,18 +36,18 @@ try {
 
   if (db) {
     // SQLite path
-    if (hasMarker(db, "stop-gate-nudged")) { db.close(); process.exit(0); }
+    if (isCleared(db, "_nudge", "stop-gate")) { db.close(); process.exit(0); }
 
     // ── Artifact completeness check ──
     try {
       const incomplete = db.prepare(
-        "SELECT scope, agent FROM cleared WHERE verdict IS NULL OR verdict = 'REVISE'"
+        "SELECT scope, agent FROM agents WHERE (verdict IS NULL OR verdict = 'REVISE') AND SUBSTR(scope, 1, 1) != '_'"
       ).all();
 
       for (const row of incomplete) {
         // Check if scope is active (has at least one PASS/CONVERGED agent)
         const active = db.prepare(
-          "SELECT 1 FROM cleared WHERE scope = ? AND verdict IN ('PASS','CONVERGED') LIMIT 1"
+          "SELECT 1 FROM agents WHERE scope = ? AND verdict IN ('PASS','CONVERGED') LIMIT 1"
         ).get(row.scope);
 
         if (!active) continue; // scope abandoned or not started — skip
@@ -197,7 +197,7 @@ try {
   if (config.stop_gate.mode === "nudge") {
     // Block-once: set marker so second stop passes
     if (db) {
-      try { setMarker(db, "stop-gate-nudged", new Date().toISOString()); } catch {}
+      try { registerAgent(db, "_nudge", "stop-gate", null); } catch {}
       db.close();
     } else {
       try {

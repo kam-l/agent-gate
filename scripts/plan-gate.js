@@ -18,7 +18,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { getDb, getEditStat, incrEditStat, setEditStat } = require("./claude-gates-db.js");
+const { getDb, getAttempts, incrAttempts, resetAttempts } = require("./claude-gates-db.js");
 
 const TRIVIAL_LINE_LIMIT = 20;
 const MAX_ATTEMPTS = 3;
@@ -38,10 +38,10 @@ try {
   let gaterVerified = false;
 
   if (db) {
-    // SQLite: check cleared table for gater with PASS or CONVERGED
+    // SQLite: check agents table for gater with PASS or CONVERGED
     try {
       const row = db.prepare(
-        "SELECT 1 FROM cleared WHERE agent = 'gater' AND verdict IN ('PASS','CONVERGED') LIMIT 1"
+        "SELECT 1 FROM agents WHERE agent = 'gater' AND verdict IN ('PASS','CONVERGED') LIMIT 1"
       ).get();
       gaterVerified = !!row;
     } catch {}
@@ -85,10 +85,10 @@ try {
   // ── Attempt tracking — auto-allow after MAX_ATTEMPTS ──
   const db2 = getDb(sessionDir);
   if (db2) {
-    incrEditStat(db2, "plan_gate_attempts", 1);
-    const attempts = getEditStat(db2, "plan_gate_attempts") || 0;
+    incrAttempts(db2, "_system", "plan-gate");
+    const attempts = getAttempts(db2, "_system", "plan-gate");
     if (attempts >= MAX_ATTEMPTS) {
-      setEditStat(db2, "plan_gate_attempts", 0);
+      resetAttempts(db2, "_system", "plan-gate");
       db2.close();
       process.stderr.write(`[ClaudeGates] Plan gate auto-allowed after ${MAX_ATTEMPTS} verification attempts.\n`);
       process.exit(0);

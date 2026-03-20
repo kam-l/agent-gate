@@ -14,7 +14,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { getDb, addEdit, getEdits, getEditStat, setEditStat, incrEditStat } = require("./claude-gates-db.js");
+const { getDb, addEdit, getEdits, getEditCounts } = require("./claude-gates-db.js");
 const { loadConfig } = require("./claude-gates-config.js");
 
 const config = loadConfig();
@@ -57,58 +57,46 @@ try {
     addEdit(db, normalized);
 
     if (isNew) {
-      incrEditStat(db, "total_files", 1);
-
-      const totalFiles = getEditStat(db, "total_files") || 0;
+      const counts = getEditCounts(db);
 
       // Lazy git stats: compute every CHECK_INTERVAL unique files
-      if (totalFiles % CHECK_INTERVAL === 0) {
+      if (counts.files % CHECK_INTERVAL === 0) {
         try {
-          const stat = execSync("git diff --stat", {
+          const stat = execSync("git diff --numstat", {
             encoding: "utf-8",
             timeout: 5000,
             stdio: ["pipe", "pipe", "pipe"]
           });
 
-          // Parse git diff --stat summary line: " N files changed, M insertions(+), K deletions(-)"
-          const summaryMatch = stat.match(/(\d+) files? changed(?:,\s*(\d+) insertions?\(\+\))?(?:,\s*(\d+) deletions?\(-\))?/);
-          if (summaryMatch) {
-            const gitFiles = parseInt(summaryMatch[1], 10) || 0;
-            const additions = parseInt(summaryMatch[2], 10) || 0;
-            const deletions = parseInt(summaryMatch[3], 10) || 0;
+          // Reset all line counts
+          db.prepare("UPDATE edits SET lines = 0").run();
 
-            // Partial commit aware: if git shows fewer uncommitted files, reset
-            if (gitFiles < totalFiles) {
-              setEditStat(db, "total_files", gitFiles);
+          // Parse per-file stats: additions\tdeletions\tfilepath
+          const diffLines = stat.trim().split("\n").filter(Boolean);
+          for (const line of diffLines) {
+            const parts = line.split("\t");
+            if (parts.length >= 3) {
+              const add = parseInt(parts[0], 10) || 0;
+              const del = parseInt(parts[1], 10) || 0;
+              const absPath = path.resolve(parts.slice(2).join("\t")).replace(/\\/g, "/");
+              addEdit(db, absPath, add + del);
             }
+          }
 
-            // Only reset line counts when git diff is completely empty
-            if (gitFiles === 0) {
-              setEditStat(db, "total_additions", 0);
-              setEditStat(db, "total_deletions", 0);
-            } else {
-              setEditStat(db, "total_additions", additions);
-              setEditStat(db, "total_deletions", deletions);
-            }
-          } else if (!stat.trim()) {
-            // Empty diff — reset everything
-            setEditStat(db, "total_files", 0);
-            setEditStat(db, "total_additions", 0);
-            setEditStat(db, "total_deletions", 0);
+          // If git shows no changes, everything was committed
+          if (diffLines.length === 0) {
+            db.prepare("DELETE FROM edits").run();
           }
         } catch {} // git unavailable — skip stats
       }
 
-      // Check thresholds and nudge
-      const currentFiles = getEditStat(db, "total_files") || 0;
-      const currentAdditions = getEditStat(db, "total_additions") || 0;
-      const currentDeletions = getEditStat(db, "total_deletions") || 0;
-      const netLines = currentAdditions + currentDeletions;
+      // Check thresholds using derived counts
+      const finalCounts = getEditCounts(db);
 
-      if (currentFiles >= FILE_THRESHOLD || netLines >= LINE_THRESHOLD) {
+      if (finalCounts.files >= FILE_THRESHOLD || finalCounts.lines >= LINE_THRESHOLD) {
         const parts = [];
-        if (currentFiles >= FILE_THRESHOLD) parts.push(`${currentFiles} files`);
-        if (netLines >= LINE_THRESHOLD) parts.push(`${netLines} lines`);
+        if (finalCounts.files >= FILE_THRESHOLD) parts.push(`${finalCounts.files} files`);
+        if (finalCounts.lines >= LINE_THRESHOLD) parts.push(`${finalCounts.lines} lines`);
         process.stderr.write(`[ClaudeGates] ${parts.join(" / ")} changed without commit. Consider committing.\n`);
       }
     }

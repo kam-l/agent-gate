@@ -330,7 +330,7 @@ const noScopeNoCgResult = runConditions({
 assert(noScopeNoCgResult.exitCode === 0, "no scope + no CG fields allows (exit 0)");
 assert(!noScopeNoCgResult.stdout.includes("block"), "no scope + no CG fields produces no block");
 
-// Deps satisfied → should allow + stage _pending
+// Deps satisfied → should allow + stage pending
 const scopeDir = path.join(tmpSession, ".claude", "sessions", "test-session", "task-2");
 fs.mkdirSync(scopeDir, { recursive: true });
 fs.writeFileSync(path.join(scopeDir, "implementer.md"), "Result: PASS\n");
@@ -341,7 +341,7 @@ const allowResult = runConditions({
 }, { USERPROFILE: tmpSession, HOME: tmpSession });
 assert(allowResult.exitCode === 0, "deps met allows (exit 0)");
 
-// Verify _pending was staged (check DB if SQLite available, else JSON)
+// Verify pending was staged (check DB if SQLite available, else JSON)
 const scopesFile = path.join(tmpSession, ".claude", "sessions", "test-session", "session_scopes.json");
 const dbFile = path.join(tmpSession, ".claude", "sessions", "test-session", "session.db");
 if (fs.existsSync(dbFile)) {
@@ -349,19 +349,19 @@ if (fs.existsSync(dbFile)) {
   const checkDb = gatesDb.getDb(path.join(tmpSession, ".claude", "sessions", "test-session"));
   if (checkDb) {
     const checkPend = gatesDb.getPending(checkDb, "reviewer");
-    assert(checkPend && checkPend.outputFilepath, "_pending staged with outputFilepath (DB)");
+    assert(checkPend && checkPend.outputFilepath, "pending staged with outputFilepath (DB)");
     checkDb.close();
   } else {
-    assert(false, "_pending staged with outputFilepath (DB open failed)");
+    assert(false, "pending staged with outputFilepath (DB open failed)");
   }
 } else if (fs.existsSync(scopesFile)) {
   const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
   assert(
     scopes._pending && scopes._pending.reviewer && scopes._pending.reviewer.outputFilepath,
-    "_pending staged with outputFilepath"
+    "pending staged with outputFilepath"
   );
 } else {
-  assert(false, "_pending staged with outputFilepath (no state file found)");
+  assert(false, "pending staged with outputFilepath (no state file found)");
 }
 
 // Reserved scope name _pending → should be treated as ungated (allow, no gating)
@@ -392,7 +392,7 @@ function runInjection(payload, env) {
   }
 }
 
-// Gated agent with _pending → should inject output_filepath with <agent_gate importance="critical">
+// Gated agent with pending → should inject output_filepath with <agent_gate importance="critical">
 const injResult = runInjection({
   session_id: "test-session",
   agent_type: "reviewer"
@@ -417,7 +417,7 @@ const noSessionResult = runInjection({
 assert(noSessionResult.exitCode === 0, "missing session_id exits 0 (fail-open)");
 assert(!noSessionResult.stdout.trim(), "missing session_id produces no output");
 
-// Ungated agent (no _pending) → should inject session_dir with plain <agent_gate>
+// Ungated agent (no pending) → should inject session_dir with plain <agent_gate>
 const ungatedResult = runInjection({
   session_id: "test-session",
   agent_type: "unknown_agent_xyz"
@@ -496,9 +496,9 @@ const reSpawnDbFile = path.join(reSpawnSessionDir, "session.db");
 if (fs.existsSync(reSpawnDbFile)) {
   // SQLite path — check DB (JSON was migrated, DB has the state)
   const rsDb = gatesDb.getDb(reSpawnSessionDir);
-  const rsCleared = gatesDb.getCleared(rsDb, "task-x", "worker");
+  const rsAgent = gatesDb.getAgent(rsDb, "task-x", "worker");
   assert(
-    rsCleared && typeof rsCleared === "object" && rsCleared.verdict === "REVISE",
+    rsAgent && rsAgent.verdict === "REVISE",
     "existing verdict object not overwritten to true on re-spawn (DB)"
   );
   rsDb.close();
@@ -775,50 +775,54 @@ assert(allUsePluginRoot, "all hooks use ${CLAUDE_PLUGIN_ROOT}");
 
 // ── SQLite DB module tests ─────────────────────────────────────────
 
-describe("SQLite DB: getDb creates session.db with all tables");
+describe("SQLite DB: getDb creates session.db with 4 tables");
 
 const tmpDbSession = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-db-"));
 const db = gatesDb.getDb(tmpDbSession);
 
 if (db) {
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
-  assert(tables.includes("scopes"), "scopes table exists");
-  assert(tables.includes("cleared"), "cleared table exists");
-  assert(tables.includes("pending"), "pending table exists");
+  assert(tables.includes("agents"), "agents table exists");
+  assert(tables.includes("gates"), "gates table exists");
   assert(tables.includes("edits"), "edits table exists");
   assert(tables.includes("tool_history"), "tool_history table exists");
-  assert(tables.includes("markers"), "markers table exists");
+  assert(!tables.includes("scopes"), "old scopes table absent");
+  assert(!tables.includes("cleared"), "old cleared table absent");
+  assert(!tables.includes("markers"), "old markers table absent");
   assert(fs.existsSync(path.join(tmpDbSession, "session.db")), "session.db file created");
 
-  // ── setClearedBoolean preservation ──
-  describe("SQLite DB: setClearedBoolean preservation");
+  // ── registerAgent + verdict preservation ──
+  describe("SQLite DB: registerAgent + verdict preservation");
 
-  gatesDb.ensureScope(db, "test-scope");
-  // First: set a verdict object
-  gatesDb.setCleared(db, "test-scope", "worker", { verdict: "REVISE", round: 1, max: 3 });
-  // Then: setClearedBoolean should NOT overwrite (INSERT OR IGNORE)
-  gatesDb.setClearedBoolean(db, "test-scope", "worker");
-  const preserved = gatesDb.getCleared(db, "test-scope", "worker");
+  gatesDb.registerAgent(db, "test-scope", "worker", "/tmp/worker.md");
+  gatesDb.setVerdict(db, "test-scope", "worker", "REVISE", 1);
+  // Re-register should NOT overwrite verdict (only updates outputFilepath)
+  gatesDb.registerAgent(db, "test-scope", "worker", "/tmp/worker2.md");
+  const preserved = gatesDb.getAgent(db, "test-scope", "worker");
   assert(
-    preserved && typeof preserved === "object" && preserved.verdict === "REVISE",
-    "existing verdict object not overwritten by setClearedBoolean"
+    preserved && preserved.verdict === "REVISE" && preserved.round === 1,
+    "existing verdict not overwritten by registerAgent"
+  );
+  assert(
+    preserved && preserved.outputFilepath === "/tmp/worker2.md",
+    "outputFilepath updated by registerAgent"
   );
 
   // ── Verdict round tracking ──
   describe("SQLite DB: verdict round tracking");
 
-  gatesDb.setCleared(db, "test-scope", "auditor", { verdict: "PASS", round: 1 });
-  const r1 = gatesDb.getCleared(db, "test-scope", "auditor");
+  gatesDb.setVerdict(db, "test-scope", "auditor", "PASS", 1);
+  const r1 = gatesDb.getAgent(db, "test-scope", "auditor");
   assert(r1 && r1.round === 1, "round 1 stored");
 
-  gatesDb.setCleared(db, "test-scope", "auditor", { verdict: "REVISE", round: 2 });
-  const r2 = gatesDb.getCleared(db, "test-scope", "auditor");
+  gatesDb.setVerdict(db, "test-scope", "auditor", "REVISE", 2);
+  const r2 = gatesDb.getAgent(db, "test-scope", "auditor");
   assert(r2 && r2.round === 2 && r2.verdict === "REVISE", "round 2 with verdict");
 
   // ── Pending roundtrip ──
   describe("SQLite DB: pending roundtrip");
 
-  gatesDb.setPending(db, "reviewer", "task-1", "/tmp/sessions/task-1/reviewer.md");
+  gatesDb.registerAgent(db, "task-1", "reviewer", "/tmp/sessions/task-1/reviewer.md");
   const pend = gatesDb.getPending(db, "reviewer");
   assert(pend && pend.outputFilepath === "/tmp/sessions/task-1/reviewer.md", "pending outputFilepath property name");
   assert(pend && pend.scope === "task-1", "pending scope");
@@ -835,6 +839,19 @@ if (db) {
   const fileCount = edits.filter(e => e === "/tmp/file.js").length;
   assert(fileCount === 1, "addEdit deduplicates same path");
 
+  // ── addEdit with lines ──
+  describe("SQLite DB: addEdit with lines");
+
+  gatesDb.addEdit(db, "/tmp/file-with-lines.js", 42);
+  const lineCounts = gatesDb.getEditCounts(db);
+  assert(lineCounts.files >= 1, "getEditCounts returns file count");
+  assert(lineCounts.lines >= 42, "getEditCounts includes lines");
+
+  // Update lines for existing file
+  gatesDb.addEdit(db, "/tmp/file-with-lines.js", 99);
+  const updated = db.prepare("SELECT lines FROM edits WHERE filepath = '/tmp/file-with-lines.js'").get();
+  assert(updated && updated.lines === 99, "addEdit with lines updates existing entry");
+
   // ── Tool history ring buffer ──
   describe("SQLite DB: tool history ring buffer");
 
@@ -846,46 +863,47 @@ if (db) {
   assert(hashes[hashes.length - 1] === "hash-11", "most recent hash is last");
   assert(hashes[0] === "hash-2", "oldest hash is hash-2 (0 and 1 trimmed)");
 
-  // ── Markers roundtrip ──
-  describe("SQLite DB: markers roundtrip");
-
-  assert(!gatesDb.hasMarker(db, "test-marker"), "marker absent before set");
-  gatesDb.setMarker(db, "test-marker", "test-value");
-  assert(gatesDb.hasMarker(db, "test-marker"), "marker present after set");
-
-  // ── isCleared and findClearedScope ──
-  describe("SQLite DB: isCleared and findClearedScope");
+  // ── isCleared and findAgentScope ──
+  describe("SQLite DB: isCleared and findAgentScope");
 
   assert(gatesDb.isCleared(db, "test-scope", "worker"), "isCleared true for existing");
   assert(!gatesDb.isCleared(db, "test-scope", "nonexistent"), "isCleared false for missing");
 
-  const foundScope = gatesDb.findClearedScope(db, "worker");
-  assert(foundScope === "test-scope", "findClearedScope returns correct scope");
-  assert(gatesDb.findClearedScope(db, "nonexistent") === null, "findClearedScope null for missing");
+  const foundScope = gatesDb.findAgentScope(db, "worker");
+  assert(foundScope === "test-scope", "findAgentScope returns correct scope");
+  assert(gatesDb.findAgentScope(db, "nonexistent") === null, "findAgentScope null for missing");
 
-  // ── registerScope atomicity ──
-  describe("SQLite DB: registerScope atomicity");
+  // System-scoped agents should not be found by findAgentScope
+  gatesDb.registerAgent(db, "_system", "plan-gate", null);
+  assert(gatesDb.findAgentScope(db, "plan-gate") === null, "findAgentScope excludes _system scope");
 
-  gatesDb.registerScope(db, "atomic-scope", "builder", "/tmp/builder.md");
-  const scopeRow = db.prepare("SELECT 1 FROM scopes WHERE scope = 'atomic-scope'").get();
-  const clearedRow = db.prepare("SELECT 1 FROM cleared WHERE scope = 'atomic-scope' AND agent = 'builder'").get();
-  const pendingRow = db.prepare("SELECT outputFilepath FROM pending WHERE agent = 'builder'").get();
-  assert(!!scopeRow, "registerScope creates scope");
-  assert(!!clearedRow, "registerScope creates cleared entry");
-  assert(pendingRow && pendingRow.outputFilepath === "/tmp/builder.md", "registerScope creates pending entry");
+  // ── registerAgent atomicity ──
+  describe("SQLite DB: registerAgent atomicity");
 
-  // ── getCleared boolean compat ──
-  describe("SQLite DB: getCleared boolean compat");
+  gatesDb.registerAgent(db, "atomic-scope", "builder", "/tmp/builder.md");
+  const agentRow = db.prepare("SELECT 1 FROM agents WHERE scope = 'atomic-scope' AND agent = 'builder'").get();
+  const pendingRow = db.prepare("SELECT outputFilepath FROM agents WHERE scope = 'atomic-scope' AND agent = 'builder'").get();
+  assert(!!agentRow, "registerAgent creates agent row");
+  assert(pendingRow && pendingRow.outputFilepath === "/tmp/builder.md", "registerAgent sets outputFilepath");
 
-  gatesDb.ensureScope(db, "bool-scope");
-  gatesDb.setClearedBoolean(db, "bool-scope", "simple-agent");
-  const boolResult = gatesDb.getCleared(db, "bool-scope", "simple-agent");
-  assert(boolResult === true, "getCleared returns true for boolean-only cleared");
-  assert(gatesDb.getCleared(db, "bool-scope", "missing") === null, "getCleared returns null for missing");
+  // ── Attempts tracking ──
+  describe("SQLite DB: attempts tracking");
+
+  assert(gatesDb.getAttempts(db, "_system", "plan-gate") === 0, "initial attempts is 0");
+  gatesDb.incrAttempts(db, "_system", "plan-gate");
+  assert(gatesDb.getAttempts(db, "_system", "plan-gate") === 1, "incrAttempts increments");
+  gatesDb.incrAttempts(db, "_system", "plan-gate");
+  assert(gatesDb.getAttempts(db, "_system", "plan-gate") === 2, "incrAttempts increments again");
+  gatesDb.resetAttempts(db, "_system", "plan-gate");
+  assert(gatesDb.getAttempts(db, "_system", "plan-gate") === 0, "resetAttempts resets to 0");
+
+  // incrAttempts on new row
+  gatesDb.incrAttempts(db, "_new", "new-agent");
+  assert(gatesDb.getAttempts(db, "_new", "new-agent") === 1, "incrAttempts creates new row with 1");
 
   db.close();
 
-  // ── Migration tests ──
+  // ── Migration tests: JSON → new schema ──
   describe("SQLite DB: migration — full state");
 
   const tmpMigrate = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-migrate-"));
@@ -909,16 +927,16 @@ if (db) {
   const mdb = gatesDb.getDb(tmpMigrate);
   if (mdb) {
     assert(gatesDb.isCleared(mdb, "scope-a", "implementer"), "migrated: implementer cleared");
-    const revObj = gatesDb.getCleared(mdb, "scope-a", "reviewer");
-    assert(revObj && revObj.verdict === "PASS" && revObj.round === 2, "migrated: reviewer verdict object");
+    const revAgent = gatesDb.getAgent(mdb, "scope-a", "reviewer");
+    assert(revAgent && revAgent.verdict === "PASS" && revAgent.round === 2, "migrated: reviewer verdict object");
     const mPend = gatesDb.getPending(mdb, "reviewer");
     assert(mPend && mPend.outputFilepath === "/tmp/reviewer.md", "migrated: pending entry");
     const mEdits = gatesDb.getEdits(mdb);
     assert(mEdits.length === 2, "migrated: 2 edit entries");
     const mHashes = gatesDb.getLastNHashes(mdb, 10);
     assert(mHashes.length === 3, "migrated: 3 tool history entries");
-    assert(gatesDb.hasMarker(mdb, "stop-gate-nudged"), "migrated: stop-gate-nudged marker");
-    assert(gatesDb.hasMarker(mdb, "json_migrated"), "migration marker set");
+    assert(gatesDb.isCleared(mdb, "_nudge", "stop-gate"), "migrated: stop-gate-nudged marker");
+    assert(gatesDb.isCleared(mdb, "_meta", "json_migrated"), "migration marker set");
     mdb.close();
   } else {
     assert(false, "migration test skipped — better-sqlite3 not available");
@@ -939,7 +957,7 @@ if (db) {
     assert(gatesDb.isCleared(pdb, "only-scope", "worker"), "partial migration: scope migrated");
     assert(gatesDb.getEdits(pdb).length === 0, "partial migration: no edits (file absent)");
     assert(gatesDb.getLastNHashes(pdb, 10).length === 0, "partial migration: no history (file absent)");
-    assert(gatesDb.hasMarker(pdb, "json_migrated"), "partial migration marker set");
+    assert(gatesDb.isCleared(pdb, "_meta", "json_migrated"), "partial migration marker set");
     pdb.close();
   } else {
     assert(false, "partial migration test skipped — better-sqlite3 not available");
@@ -952,7 +970,7 @@ if (db) {
   const tmpFresh = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-migrate-fresh-"));
   const fdb = gatesDb.getDb(tmpFresh);
   if (fdb) {
-    assert(!gatesDb.hasMarker(fdb, "json_migrated"), "fresh session: no migration marker");
+    assert(!gatesDb.isCleared(fdb, "_meta", "json_migrated"), "fresh session: no migration marker");
     assert(gatesDb.getEdits(fdb).length === 0, "fresh session: empty edits");
     fdb.close();
   } else {
@@ -1138,7 +1156,7 @@ const noPlanResult = runPlanGate(
 assert(noPlanResult.exitCode === 0 && !noPlanResult.stdout.includes("block"), "no plans dir allows (fail-open)");
 fs.rmSync(noPlanHome, { recursive: true, force: true });
 
-// Test: gater verdict PASS in session_scopes → allow
+// Test: gater verdict PASS in session → allow
 const planVerdictHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-plan-verdict-"));
 const planVerdictPlans = path.join(planVerdictHome, ".claude", "plans");
 fs.mkdirSync(planVerdictPlans, { recursive: true });
@@ -1149,8 +1167,7 @@ fs.mkdirSync(planVerdictSession, { recursive: true });
 // Seed gater verdict via DB or JSON
 const pvDb = gatesDb.getDb(planVerdictSession);
 if (pvDb) {
-  gatesDb.ensureScope(pvDb, "verify-plan");
-  gatesDb.setCleared(pvDb, "verify-plan", "gater", { verdict: "PASS", round: 1 });
+  gatesDb.setVerdict(pvDb, "verify-plan", "gater", "PASS", 1);
   pvDb.close();
 } else {
   fs.writeFileSync(path.join(planVerdictSession, "session_scopes.json"), JSON.stringify({
@@ -1169,8 +1186,7 @@ const planConvSession = path.join(planVerdictHome, ".claude", "sessions", "plan-
 fs.mkdirSync(planConvSession, { recursive: true });
 const pcDb = gatesDb.getDb(planConvSession);
 if (pcDb) {
-  gatesDb.ensureScope(pcDb, "verify-plan");
-  gatesDb.setCleared(pcDb, "verify-plan", "gater", { verdict: "CONVERGED", round: 1 });
+  gatesDb.setVerdict(pcDb, "verify-plan", "gater", "CONVERGED", 1);
   pcDb.close();
 } else {
   fs.writeFileSync(path.join(planConvSession, "session_scopes.json"), JSON.stringify({
@@ -1189,8 +1205,7 @@ const planFailSession = path.join(planVerdictHome, ".claude", "sessions", "plan-
 fs.mkdirSync(planFailSession, { recursive: true });
 const pfDb = gatesDb.getDb(planFailSession);
 if (pfDb) {
-  gatesDb.ensureScope(pfDb, "verify-plan");
-  gatesDb.setCleared(pfDb, "verify-plan", "gater", { verdict: "FAIL", round: 1 });
+  gatesDb.setVerdict(pfDb, "verify-plan", "gater", "FAIL", 1);
   pfDb.close();
 } else {
   fs.writeFileSync(path.join(planFailSession, "session_scopes.json"), JSON.stringify({
@@ -1357,7 +1372,7 @@ try { fs.unlinkSync(commitPassConfig); } catch {}
 
 // ── edit-gate enhancements ─────────────────────────────────────────────
 
-describe("edit-gate: file count tracking and stats");
+describe("edit-gate: file count tracking");
 
 const tmpEditEnhanced = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-edit-enh-"));
 const editEnhSessionDir = path.join(tmpEditEnhanced, ".claude", "sessions", "edit-enh-test");
@@ -1376,9 +1391,9 @@ const editEnhDbPath = path.join(editEnhSessionDir, "session.db");
 const editEnhStatsPath = path.join(editEnhSessionDir, "edit_stats.json");
 if (fs.existsSync(editEnhDbPath)) {
   const eenhDb = gatesDb.getDb(editEnhSessionDir);
-  const totalFiles = gatesDb.getEditStat(eenhDb, "total_files");
-  // Stats may have been adjusted by lazy git diff, but should be > 0
-  assert(totalFiles !== null && totalFiles > 0, "edit-gate tracks file count (DB)");
+  const counts = gatesDb.getEditCounts(eenhDb);
+  // File count derived from edits table; may be adjusted by lazy git diff, but should be > 0
+  assert(counts.files > 0, "edit-gate tracks file count (DB)");
   eenhDb.close();
 } else if (fs.existsSync(editEnhStatsPath)) {
   const stats = JSON.parse(fs.readFileSync(editEnhStatsPath, "utf-8"));
@@ -1473,75 +1488,16 @@ assert(abandonedResult.exitCode === 0 && !abandonedResult.stdout.includes("revie
 fs.rmSync(tmpStopArtifact, { recursive: true, force: true });
 fs.rmSync(tmpStopAbandoned, { recursive: true, force: true });
 
-// ── SQLite DB: deleteMarker ─────────────────────────────────────────
+// ── SQLite DB: gates operations ─────────────────────────────────────
 
-describe("SQLite DB: deleteMarker");
+describe("SQLite DB: gates operations");
 
-const tmpDelMarker = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-delmarker-"));
-const delDb = gatesDb.getDb(tmpDelMarker);
-if (delDb) {
-  gatesDb.setMarker(delDb, "to-delete", "some-value");
-  assert(gatesDb.hasMarker(delDb, "to-delete"), "marker exists before delete");
-
-  gatesDb.deleteMarker(delDb, "to-delete");
-  assert(!gatesDb.hasMarker(delDb, "to-delete"), "marker removed after delete");
-
-  // Double-delete is no-op
-  gatesDb.deleteMarker(delDb, "to-delete");
-  assert(!gatesDb.hasMarker(delDb, "to-delete"), "double delete is no-op");
-
-  delDb.close();
-} else {
-  console.log("  SKIP: deleteMarker tests — better-sqlite3 not available");
-}
-fs.rmSync(tmpDelMarker, { recursive: true, force: true });
-
-// ── SQLite DB: edit_stats operations ────────────────────────────────
-
-describe("SQLite DB: edit_stats operations");
-
-const tmpEditStats = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-editstats-"));
-const esDb = gatesDb.getDb(tmpEditStats);
-if (esDb) {
-  // Verify table exists
-  const esTables = esDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='edit_stats'").get();
-  assert(!!esTables, "edit_stats table exists");
-
-  // getEditStat returns null for missing key
-  assert(gatesDb.getEditStat(esDb, "nonexistent") === null, "getEditStat null for missing");
-
-  // setEditStat + getEditStat roundtrip
-  gatesDb.setEditStat(esDb, "total_files", 5);
-  assert(gatesDb.getEditStat(esDb, "total_files") === 5, "setEditStat/getEditStat roundtrip");
-
-  // incrEditStat
-  gatesDb.incrEditStat(esDb, "total_files", 3);
-  assert(gatesDb.getEditStat(esDb, "total_files") === 8, "incrEditStat adds to existing");
-
-  // incrEditStat on new key
-  gatesDb.incrEditStat(esDb, "total_additions", 100);
-  assert(gatesDb.getEditStat(esDb, "total_additions") === 100, "incrEditStat creates new key");
-
-  // setEditStat overwrites
-  gatesDb.setEditStat(esDb, "total_files", 0);
-  assert(gatesDb.getEditStat(esDb, "total_files") === 0, "setEditStat overwrites to 0");
-
-  esDb.close();
-} else {
-  console.log("  SKIP: edit_stats tests — better-sqlite3 not available");
-}
-fs.rmSync(tmpEditStats, { recursive: true, force: true });
-
-// ── SQLite DB: scope_gates operations ─────────────────────────────────
-
-describe("SQLite DB: scope_gates operations");
-
-const tmpGates = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-scopegates-"));
+const tmpGates = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gates-"));
 const gDb = gatesDb.getDb(tmpGates);
 if (gDb) {
   // Verify table exists
-  const gtTables = gDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='scope_gates'").get();
-  assert(!!gtTables, "scope_gates table exists");
+  const gtTables = gDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='gates'").get();
+  assert(!!gtTables, "gates table exists");
 
   // initGates creates correct rows
   gatesDb.initGates(gDb, "task-1", "implementer", [
@@ -1608,7 +1564,7 @@ if (gDb) {
 
   gDb.close();
 } else {
-  console.log("  SKIP: scope_gates tests — better-sqlite3 not available");
+  console.log("  SKIP: gates tests — better-sqlite3 not available");
 }
 fs.rmSync(tmpGates, { recursive: true, force: true });
 
@@ -1665,7 +1621,7 @@ function runVerification(payload, env) {
   }
 }
 
-// Test: gater SubagentStop with Result: PASS in message → verdict recorded to session_scopes
+// Test: gater SubagentStop with Result: PASS in message → verdict recorded
 const tmpGaterHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gater-fb-"));
 const gaterSessionDir = path.join(tmpGaterHome, ".claude", "sessions", "gater-fb-test");
 fs.mkdirSync(gaterSessionDir, { recursive: true });
@@ -1684,7 +1640,7 @@ assert(!gaterResult.stdout.includes("block"), "gater fallback does not block");
 const gfDb = gatesDb.getDb(gaterSessionDir);
 if (gfDb) {
   const row = gfDb.prepare(
-    "SELECT verdict FROM cleared WHERE scope = 'gater-review' AND agent = 'gater'"
+    "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
   ).get();
   assert(row && row.verdict === "PASS", "gater PASS verdict recorded in SQLite");
   gfDb.close();
@@ -1715,7 +1671,7 @@ assert(gaterResult2.exitCode === 0, "gater no-verdict exits 0");
 const gf2Db = gatesDb.getDb(gaterSessionDir2);
 if (gf2Db) {
   const row2 = gf2Db.prepare(
-    "SELECT verdict FROM cleared WHERE scope = 'gater-review' AND agent = 'gater'"
+    "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
   ).get();
   assert(!row2, "no verdict recorded when message lacks Result: line");
   gf2Db.close();
@@ -1741,7 +1697,7 @@ assert(gaterResult3.exitCode === 0, "gater CONVERGED exits 0");
 const gf3Db = gatesDb.getDb(gaterSessionDir3);
 if (gf3Db) {
   const row3 = gf3Db.prepare(
-    "SELECT verdict FROM cleared WHERE scope = 'gater-review' AND agent = 'gater'"
+    "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
   ).get();
   assert(row3 && row3.verdict === "CONVERGED", "gater CONVERGED verdict recorded");
   gf3Db.close();
@@ -1777,7 +1733,7 @@ assert(!gaterResult4.stdout.includes("block"), "plugin-qualified gater does not 
 const gf4Db = gatesDb.getDb(gaterSessionDir4);
 if (gf4Db) {
   const row4 = gf4Db.prepare(
-    "SELECT verdict FROM cleared WHERE scope = 'gater-review' AND agent = 'gater'"
+    "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
   ).get();
   assert(row4 && row4.verdict === "PASS", "plugin-qualified gater PASS verdict recorded in SQLite");
   gf4Db.close();

@@ -2,32 +2,36 @@
 /**
  * ClaudeGates v2 — SQLite session state module.
  *
- * Provides atomic DB operations for session state, replacing JSON read-modify-write.
+ * 4-table schema: agents, gates, edits, tool_history.
  * Falls back gracefully: if better-sqlite3 is not installed, getDb() returns null
  * and all hooks use existing JSON code paths.
  *
  * Exports:
  *   getDb(sessionDir)                              → Database | null
- *   ensureScope(db, scope)                         → void
- *   setClearedBoolean(db, scope, agent)            → void
- *   setCleared(db, scope, agent, verdictObj)       → void  (verdictObj: { verdict, round })
- *   getCleared(db, scope, agent)                   → { verdict, round } | true | null
+ *   registerAgent(db, scope, agent, outputFilepath) → void
+ *   setVerdict(db, scope, agent, verdict, round)   → void
+ *   getAgent(db, scope, agent)                     → row | null
  *   isCleared(db, scope, agent)                    → boolean
- *   findClearedScope(db, agent)                    → string | null
- *   setPending(db, agent, scope, filepath)         → void
+ *   findAgentScope(db, agent)                      → string | null
  *   getPending(db, agent)                          → { scope, outputFilepath } | null
- *   addEdit(db, filepath)                          → void
+ *   incrAttempts(db, scope, agent)                 → void
+ *   getAttempts(db, scope, agent)                  → number
+ *   resetAttempts(db, scope, agent)                → void
+ *   addEdit(db, filepath[, lines])                 → void
  *   getEdits(db)                                   → string[]
+ *   getEditCounts(db)                              → { files, lines }
  *   addToolHash(db, hash)                          → void
  *   getLastNHashes(db, n)                          → string[]
- *   hasMarker(db, name)                            → boolean
- *   setMarker(db, name, value)                     → void
- *   deleteMarker(db, name)                         → void
- *   getEditStat(db, key)                           → number | null
- *   setEditStat(db, key, value)                    → void
- *   incrEditStat(db, key, delta)                   → void
- *   registerScope(db, scope, agent, outputFilepath)→ void
  *   migrateFromJson(sessionDir, db)                → void
+ *   // Gate operations
+ *   initGates(db, scope, sourceAgent, gates)       → void
+ *   getActiveGate(db, scope)                       → row | null
+ *   getReviseGate(db, scope)                       → row | null
+ *   getGates(db, scope)                            → row[]
+ *   passGate(db, scope, order)                     → { nextGate, allPassed }
+ *   reviseGate(db, scope, order)                   → { status, round } | null
+ *   reactivateReviseGate(db, scope)                → boolean
+ *   hasActiveGates(db, scope)                      → boolean
  */
 
 const fs = require("fs");
@@ -37,54 +41,35 @@ let Database;
 try { Database = require("better-sqlite3"); } catch { Database = null; }
 
 const SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS scopes (
-  scope TEXT PRIMARY KEY,
-  CHECK (scope != '_pending')
-);
-
-CREATE TABLE IF NOT EXISTS cleared (
-  scope     TEXT NOT NULL,
-  agent     TEXT NOT NULL,
-  verdict   TEXT,
-  round     INTEGER,
+CREATE TABLE IF NOT EXISTS agents (
+  scope          TEXT NOT NULL,
+  agent          TEXT NOT NULL,
+  outputFilepath TEXT,
+  verdict        TEXT,
+  round          INTEGER,
+  attempts       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (scope, agent)
 );
 
-CREATE TABLE IF NOT EXISTS pending (
-  agent          TEXT PRIMARY KEY,
-  scope          TEXT NOT NULL,
-  outputFilepath TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS edits (
-  filepath TEXT PRIMARY KEY
-);
-
-CREATE TABLE IF NOT EXISTS tool_history (
-  id   INTEGER PRIMARY KEY AUTOINCREMENT,
-  hash TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS markers (
-  name       TEXT PRIMARY KEY,
-  value      TEXT,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS edit_stats (
-  key   TEXT PRIMARY KEY,
-  value INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS scope_gates (
+CREATE TABLE IF NOT EXISTS gates (
   scope        TEXT NOT NULL,
-  seq          INTEGER NOT NULL,
+  "order"      INTEGER NOT NULL,
   gate_agent   TEXT NOT NULL,
   max_rounds   INTEGER NOT NULL DEFAULT 3,
   status       TEXT NOT NULL DEFAULT 'pending',
   round        INTEGER NOT NULL DEFAULT 0,
   source_agent TEXT NOT NULL,
-  PRIMARY KEY (scope, seq)
+  PRIMARY KEY (scope, "order")
+);
+
+CREATE TABLE IF NOT EXISTS edits (
+  filepath TEXT PRIMARY KEY,
+  lines    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS tool_history (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  hash TEXT NOT NULL
 );
 `;
 
@@ -116,10 +101,26 @@ function getDb(sessionDir) {
   db.exec(SCHEMA_SQL);
   db.exec(TRIGGER_SQL);
 
-  // Check migration marker
-  const migrated = db.prepare("SELECT 1 FROM markers WHERE name = 'json_migrated'").get();
-  if (!migrated) {
-    // Check if old JSON files exist — migrate if so
+  // Upgrade edits table from old schema (add lines column if missing)
+  try {
+    db.prepare("SELECT lines FROM edits LIMIT 0").get();
+  } catch {
+    try { db.exec("ALTER TABLE edits ADD COLUMN lines INTEGER NOT NULL DEFAULT 0"); } catch {}
+  }
+
+  // Migrate old SQLite schema → new (if old tables exist)
+  const hasOldScopes = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scopes'"
+  ).get();
+  if (hasOldScopes) {
+    migrateOldSchema(db);
+  }
+
+  // Check JSON migration marker (now stored in agents table)
+  const hasMigrated = db.prepare(
+    "SELECT 1 FROM agents WHERE scope = '_meta' AND agent = 'json_migrated'"
+  ).get();
+  if (!hasMigrated) {
     const scopesFile = path.join(sessionDir, "session_scopes.json");
     const editsFile = path.join(sessionDir, "edits.log");
     const historyFile = path.join(sessionDir, "tool_history.json");
@@ -137,12 +138,94 @@ function getDb(sessionDir) {
 }
 
 /**
+ * Migrate old SQLite schema (8 tables) → new (4 tables).
+ * Called when old 'scopes' table is detected.
+ */
+function migrateOldSchema(db) {
+  const migrate = db.transaction(() => {
+    // Re-check inside transaction (concurrency guard)
+    const hasOld = db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scopes'"
+    ).get();
+    if (!hasOld) return;
+
+    // Migrate cleared → agents
+    try {
+      const rows = db.prepare("SELECT scope, agent, verdict, round FROM cleared").all();
+      for (const r of rows) {
+        db.prepare(
+          "INSERT OR IGNORE INTO agents (scope, agent, verdict, round) VALUES (?, ?, ?, ?)"
+        ).run(r.scope, r.agent, r.verdict, r.round);
+      }
+    } catch {}
+
+    // Migrate pending → agents (update outputFilepath)
+    try {
+      const rows = db.prepare("SELECT agent, scope, outputFilepath FROM pending").all();
+      for (const r of rows) {
+        db.prepare(
+          "INSERT INTO agents (scope, agent, outputFilepath) VALUES (?, ?, ?) " +
+          "ON CONFLICT(scope, agent) DO UPDATE SET outputFilepath = excluded.outputFilepath"
+        ).run(r.scope, r.agent, r.outputFilepath);
+      }
+    } catch {}
+
+    // Migrate scope_gates → gates
+    try {
+      const rows = db.prepare(
+        "SELECT scope, seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates"
+      ).all();
+      for (const r of rows) {
+        db.prepare(
+          'INSERT OR IGNORE INTO gates (scope, "order", gate_agent, max_rounds, status, round, source_agent) ' +
+          "VALUES (?, ?, ?, ?, ?, ?, ?)"
+        ).run(r.scope, r.seq, r.gate_agent, r.max_rounds, r.status, r.round, r.source_agent);
+      }
+    } catch {}
+
+    // Migrate markers → agents (special rows)
+    try {
+      const nudge = db.prepare("SELECT value FROM markers WHERE name = 'stop-gate-nudged'").get();
+      if (nudge) {
+        db.prepare("INSERT OR IGNORE INTO agents (scope, agent) VALUES ('_nudge', 'stop-gate')").run();
+      }
+      const migrated = db.prepare("SELECT 1 FROM markers WHERE name = 'json_migrated'").get();
+      if (migrated) {
+        db.prepare("INSERT OR IGNORE INTO agents (scope, agent) VALUES ('_meta', 'json_migrated')").run();
+      }
+    } catch {}
+
+    // Migrate edit_stats → agents (plan_gate_attempts)
+    try {
+      const attempts = db.prepare("SELECT value FROM edit_stats WHERE key = 'plan_gate_attempts'").get();
+      if (attempts) {
+        db.prepare(
+          "INSERT INTO agents (scope, agent, attempts) VALUES ('_system', 'plan-gate', ?) " +
+          "ON CONFLICT(scope, agent) DO UPDATE SET attempts = excluded.attempts"
+        ).run(attempts.value);
+      }
+    } catch {}
+
+    // Drop old tables
+    db.exec("DROP TABLE IF EXISTS scopes");
+    db.exec("DROP TABLE IF EXISTS cleared");
+    db.exec("DROP TABLE IF EXISTS pending");
+    db.exec("DROP TABLE IF EXISTS scope_gates");
+    db.exec("DROP TABLE IF EXISTS markers");
+    db.exec("DROP TABLE IF EXISTS edit_stats");
+  });
+  migrate();
+}
+
+/**
  * One-time import of JSON state into SQLite, inside a transaction.
  */
 function migrateFromJson(sessionDir, db) {
   const migrate = db.transaction(() => {
     // Re-check marker inside transaction (handles concurrent hooks)
-    const already = db.prepare("SELECT 1 FROM markers WHERE name = 'json_migrated'").get();
+    const already = db.prepare(
+      "SELECT 1 FROM agents WHERE scope = '_meta' AND agent = 'json_migrated'"
+    ).get();
     if (already) return;
 
     // Migrate session_scopes.json
@@ -155,23 +238,26 @@ function migrateFromJson(sessionDir, db) {
           if (info && typeof info === "object") {
             for (const [agent, pending] of Object.entries(info)) {
               if (pending && pending.outputFilepath) {
-                db.prepare("INSERT OR IGNORE INTO pending (agent, scope, outputFilepath) VALUES (?, ?, ?)")
-                  .run(agent, pending.scope || "", pending.outputFilepath);
+                db.prepare(
+                  "INSERT INTO agents (scope, agent, outputFilepath) VALUES (?, ?, ?) " +
+                  "ON CONFLICT(scope, agent) DO UPDATE SET outputFilepath = excluded.outputFilepath"
+                ).run(pending.scope || "", agent, pending.outputFilepath);
               }
             }
           }
           continue;
         }
-        db.prepare("INSERT OR IGNORE INTO scopes (scope) VALUES (?)").run(scope);
         if (info && info.cleared) {
           for (const [agent, val] of Object.entries(info.cleared)) {
             if (val && typeof val === "object") {
               db.prepare(
-                "INSERT OR IGNORE INTO cleared (scope, agent, verdict, round) VALUES (?, ?, ?, ?)"
+                "INSERT OR IGNORE INTO agents (scope, agent, verdict, round) VALUES (?, ?, ?, ?)"
               ).run(scope, agent, val.verdict || null, val.round || null);
             } else {
               // boolean true — cleared with no verdict
-              db.prepare("INSERT OR IGNORE INTO cleared (scope, agent) VALUES (?, ?)").run(scope, agent);
+              db.prepare(
+                "INSERT OR IGNORE INTO agents (scope, agent) VALUES (?, ?)"
+              ).run(scope, agent);
             }
           }
         }
@@ -205,78 +291,139 @@ function migrateFromJson(sessionDir, db) {
     try {
       const markerFile = path.join(sessionDir, ".stop-gate-nudged");
       if (fs.existsSync(markerFile)) {
-        const value = fs.readFileSync(markerFile, "utf-8").trim() || null;
-        db.prepare("INSERT OR REPLACE INTO markers (name, value) VALUES (?, ?)").run("stop-gate-nudged", value);
+        db.prepare(
+          "INSERT OR IGNORE INTO agents (scope, agent) VALUES ('_nudge', 'stop-gate')"
+        ).run();
       }
     } catch {} // missing — skip
 
     // Set migration marker
-    db.prepare("INSERT INTO markers (name, value) VALUES (?, datetime('now'))").run("json_migrated");
+    db.prepare(
+      "INSERT OR IGNORE INTO agents (scope, agent) VALUES ('_meta', 'json_migrated')"
+    ).run();
   });
 
   migrate();
 }
 
-// ── Scope operations ──────────────────────────────────────────────────
+// ── Agent operations ──────────────────────────────────────────────────
 
-function ensureScope(db, scope) {
-  db.prepare("INSERT OR IGNORE INTO scopes (scope) VALUES (?)").run(scope);
-}
-
-function setClearedBoolean(db, scope, agent) {
-  db.prepare("INSERT OR IGNORE INTO cleared (scope, agent) VALUES (?, ?)").run(scope, agent);
-}
-
-function setCleared(db, scope, agent, verdictObj) {
+/**
+ * Register an agent for a scope. Creates row or updates outputFilepath.
+ * Does NOT overwrite verdict/round — preserves existing verdicts on re-spawn.
+ */
+function registerAgent(db, scope, agent, outputFilepath) {
   db.prepare(
-    "INSERT OR REPLACE INTO cleared (scope, agent, verdict, round) VALUES (?, ?, ?, ?)"
-  ).run(
-    scope, agent,
-    verdictObj.verdict || null,
-    verdictObj.round || null
-  );
+    "INSERT INTO agents (scope, agent, outputFilepath) VALUES (?, ?, ?) " +
+    "ON CONFLICT(scope, agent) DO UPDATE SET outputFilepath = excluded.outputFilepath"
+  ).run(scope, agent, outputFilepath);
 }
 
-function getCleared(db, scope, agent) {
-  const row = db.prepare("SELECT verdict, round FROM cleared WHERE scope = ? AND agent = ?").get(scope, agent);
-  if (!row) return null;
-  if (row.verdict === null && row.round === null) return true;
-  const obj = {};
-  if (row.verdict !== null) obj.verdict = row.verdict;
-  if (row.round !== null) obj.round = row.round;
-  return obj;
+/**
+ * Record a structured verdict. Creates row if missing.
+ */
+function setVerdict(db, scope, agent, verdict, round) {
+  db.prepare(
+    "INSERT INTO agents (scope, agent, verdict, round) VALUES (?, ?, ?, ?) " +
+    "ON CONFLICT(scope, agent) DO UPDATE SET verdict = excluded.verdict, round = excluded.round"
+  ).run(scope, agent, verdict, round);
 }
 
+/**
+ * Get full agent row. Returns null if not found.
+ */
+function getAgent(db, scope, agent) {
+  return db.prepare(
+    "SELECT scope, agent, outputFilepath, verdict, round, attempts FROM agents WHERE scope = ? AND agent = ?"
+  ).get(scope, agent) || null;
+}
+
+/**
+ * Check if agent is registered (row exists).
+ */
 function isCleared(db, scope, agent) {
-  const row = db.prepare("SELECT 1 FROM cleared WHERE scope = ? AND agent = ?").get(scope, agent);
+  const row = db.prepare("SELECT 1 FROM agents WHERE scope = ? AND agent = ?").get(scope, agent);
   return !!row;
 }
 
-function findClearedScope(db, agent) {
-  const row = db.prepare("SELECT scope FROM cleared WHERE agent = ? LIMIT 1").get(agent);
+/**
+ * Find which scope an agent is registered in (excludes system scopes starting with _).
+ */
+function findAgentScope(db, agent) {
+  const row = db.prepare(
+    "SELECT scope FROM agents WHERE agent = ? AND SUBSTR(scope, 1, 1) != '_' LIMIT 1"
+  ).get(agent);
   return row ? row.scope : null;
 }
 
-// ── Pending operations ────────────────────────────────────────────────
-
-function setPending(db, agent, scope, filepath) {
-  db.prepare("INSERT OR REPLACE INTO pending (agent, scope, outputFilepath) VALUES (?, ?, ?)").run(agent, scope, filepath);
+/**
+ * Get pending info (scope + outputFilepath) for an agent.
+ * Excludes system scopes.
+ */
+function getPending(db, agent) {
+  const row = db.prepare(
+    "SELECT scope, outputFilepath FROM agents WHERE agent = ? AND outputFilepath IS NOT NULL AND SUBSTR(scope, 1, 1) != '_' LIMIT 1"
+  ).get(agent);
+  return row || null;
 }
 
-function getPending(db, agent) {
-  const row = db.prepare("SELECT scope, outputFilepath FROM pending WHERE agent = ?").get(agent);
-  return row || null;
+/**
+ * Increment attempts counter for an agent. Creates row if missing.
+ */
+function incrAttempts(db, scope, agent) {
+  db.prepare(
+    "INSERT INTO agents (scope, agent, attempts) VALUES (?, ?, 1) " +
+    "ON CONFLICT(scope, agent) DO UPDATE SET attempts = attempts + 1"
+  ).run(scope, agent);
+}
+
+/**
+ * Get attempts counter for an agent.
+ */
+function getAttempts(db, scope, agent) {
+  const row = db.prepare("SELECT attempts FROM agents WHERE scope = ? AND agent = ?").get(scope, agent);
+  return row ? row.attempts : 0;
+}
+
+/**
+ * Reset attempts counter for an agent.
+ */
+function resetAttempts(db, scope, agent) {
+  db.prepare(
+    "INSERT INTO agents (scope, agent, attempts) VALUES (?, ?, 0) " +
+    "ON CONFLICT(scope, agent) DO UPDATE SET attempts = 0"
+  ).run(scope, agent);
 }
 
 // ── Edit tracking ─────────────────────────────────────────────────────
 
-function addEdit(db, filepath) {
-  db.prepare("INSERT OR IGNORE INTO edits (filepath) VALUES (?)").run(filepath);
+/**
+ * Track an edited file. If lines provided, updates lines count.
+ * Without lines, INSERT OR IGNORE (no-op on existing).
+ */
+function addEdit(db, filepath, lines) {
+  if (lines != null) {
+    db.prepare(
+      "INSERT INTO edits (filepath, lines) VALUES (?, ?) ON CONFLICT(filepath) DO UPDATE SET lines = excluded.lines"
+    ).run(filepath, lines);
+  } else {
+    db.prepare("INSERT OR IGNORE INTO edits (filepath) VALUES (?)").run(filepath);
+  }
 }
 
 function getEdits(db) {
   const rows = db.prepare("SELECT filepath FROM edits").all();
   return rows.map(r => r.filepath);
+}
+
+/**
+ * Get aggregate edit counts: { files, lines }.
+ */
+function getEditCounts(db) {
+  const row = db.prepare(
+    "SELECT COUNT(*) as files, COALESCE(SUM(lines), 0) as lines FROM edits"
+  ).get();
+  return { files: row.files, lines: row.lines };
 }
 
 // ── Tool history (ring buffer) ────────────────────────────────────────
@@ -290,38 +437,6 @@ function getLastNHashes(db, n) {
   return rows.map(r => r.hash).reverse();
 }
 
-// ── Markers ───────────────────────────────────────────────────────────
-
-function hasMarker(db, name) {
-  const row = db.prepare("SELECT 1 FROM markers WHERE name = ?").get(name);
-  return !!row;
-}
-
-function setMarker(db, name, value) {
-  db.prepare("INSERT OR REPLACE INTO markers (name, value) VALUES (?, ?)").run(name, value || null);
-}
-
-function deleteMarker(db, name) {
-  db.prepare("DELETE FROM markers WHERE name = ?").run(name);
-}
-
-// ── Edit stats ────────────────────────────────────────────────────────────
-
-function getEditStat(db, key) {
-  const row = db.prepare("SELECT value FROM edit_stats WHERE key = ?").get(key);
-  return row ? row.value : null;
-}
-
-function setEditStat(db, key, value) {
-  db.prepare("INSERT OR REPLACE INTO edit_stats (key, value) VALUES (?, ?)").run(key, value);
-}
-
-function incrEditStat(db, key, delta) {
-  db.prepare(
-    "INSERT INTO edit_stats (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = value + ?"
-  ).run(key, delta, delta);
-}
-
 // ── Gate operations ───────────────────────────────────────────────────
 
 /**
@@ -331,12 +446,12 @@ function incrEditStat(db, key, delta) {
  */
 function initGates(db, scope, sourceAgent, gates) {
   const init = db.transaction(() => {
-    const existing = db.prepare("SELECT 1 FROM scope_gates WHERE scope = ? LIMIT 1").get(scope);
+    const existing = db.prepare("SELECT 1 FROM gates WHERE scope = ? LIMIT 1").get(scope);
     if (existing) return;
     for (let i = 0; i < gates.length; i++) {
       const status = i === 0 ? "active" : "pending";
       db.prepare(
-        "INSERT INTO scope_gates (scope, seq, gate_agent, max_rounds, status, round, source_agent) VALUES (?, ?, ?, ?, ?, 0, ?)"
+        'INSERT INTO gates (scope, "order", gate_agent, max_rounds, status, round, source_agent) VALUES (?, ?, ?, ?, ?, 0, ?)'
       ).run(scope, i, gates[i].agent, gates[i].maxRounds, status, sourceAgent);
     }
   });
@@ -348,7 +463,7 @@ function initGates(db, scope, sourceAgent, gates) {
  */
 function getActiveGate(db, scope) {
   return db.prepare(
-    "SELECT seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates WHERE scope = ? AND status = 'active' LIMIT 1"
+    'SELECT "order", gate_agent, max_rounds, status, round, source_agent FROM gates WHERE scope = ? AND status = \'active\' LIMIT 1'
   ).get(scope) || null;
 }
 
@@ -357,16 +472,16 @@ function getActiveGate(db, scope) {
  */
 function getReviseGate(db, scope) {
   return db.prepare(
-    "SELECT seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates WHERE scope = ? AND status = 'revise' LIMIT 1"
+    'SELECT "order", gate_agent, max_rounds, status, round, source_agent FROM gates WHERE scope = ? AND status = \'revise\' LIMIT 1'
   ).get(scope) || null;
 }
 
 /**
- * Get all gates for a scope, ordered by seq.
+ * Get all gates for a scope, ordered by "order".
  */
 function getGates(db, scope) {
   return db.prepare(
-    "SELECT seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates WHERE scope = ? ORDER BY seq"
+    'SELECT "order", gate_agent, max_rounds, status, round, source_agent FROM gates WHERE scope = ? ORDER BY "order"'
   ).all(scope);
 }
 
@@ -374,21 +489,21 @@ function getGates(db, scope) {
  * Transition a gate to 'passed' and activate the next gate (if any).
  * Returns { nextGate: row | null, allPassed: boolean }.
  */
-function passGate(db, scope, seq) {
+function passGate(db, scope, order) {
   const result = { nextGate: null, allPassed: false };
   const pass = db.transaction(() => {
-    db.prepare("UPDATE scope_gates SET status = 'passed' WHERE scope = ? AND seq = ?").run(scope, seq);
+    db.prepare('UPDATE gates SET status = \'passed\' WHERE scope = ? AND "order" = ?').run(scope, order);
     const next = db.prepare(
-      "SELECT seq FROM scope_gates WHERE scope = ? AND seq > ? AND status = 'pending' ORDER BY seq LIMIT 1"
-    ).get(scope, seq);
+      'SELECT "order" FROM gates WHERE scope = ? AND "order" > ? AND status = \'pending\' ORDER BY "order" LIMIT 1'
+    ).get(scope, order);
     if (next) {
-      db.prepare("UPDATE scope_gates SET status = 'active' WHERE scope = ? AND seq = ?").run(scope, next.seq);
+      db.prepare('UPDATE gates SET status = \'active\' WHERE scope = ? AND "order" = ?').run(scope, next.order);
       result.nextGate = db.prepare(
-        "SELECT seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates WHERE scope = ? AND seq = ?"
-      ).get(scope, next.seq);
+        'SELECT "order", gate_agent, max_rounds, status, round, source_agent FROM gates WHERE scope = ? AND "order" = ?'
+      ).get(scope, next.order);
     } else {
       const nonPassed = db.prepare(
-        "SELECT 1 FROM scope_gates WHERE scope = ? AND status != 'passed' LIMIT 1"
+        "SELECT 1 FROM gates WHERE scope = ? AND status != 'passed' LIMIT 1"
       ).get(scope);
       result.allPassed = !nonPassed;
     }
@@ -401,21 +516,21 @@ function passGate(db, scope, seq) {
  * Set a gate to 'revise' status and increment round.
  * If round >= maxRounds, set to 'failed' instead.
  */
-function reviseGate(db, scope, seq) {
+function reviseGate(db, scope, order) {
   let result = null;
   const revise = db.transaction(() => {
     const gate = db.prepare(
-      "SELECT round, max_rounds FROM scope_gates WHERE scope = ? AND seq = ?"
-    ).get(scope, seq);
+      'SELECT round, max_rounds FROM gates WHERE scope = ? AND "order" = ?'
+    ).get(scope, order);
     if (!gate) return;
     const newRound = gate.round + 1;
     if (newRound >= gate.max_rounds) {
-      db.prepare("UPDATE scope_gates SET status = 'failed', round = ? WHERE scope = ? AND seq = ?")
-        .run(newRound, scope, seq);
+      db.prepare('UPDATE gates SET status = \'failed\', round = ? WHERE scope = ? AND "order" = ?')
+        .run(newRound, scope, order);
       result = { status: "failed", round: newRound };
     } else {
-      db.prepare("UPDATE scope_gates SET status = 'revise', round = ? WHERE scope = ? AND seq = ?")
-        .run(newRound, scope, seq);
+      db.prepare('UPDATE gates SET status = \'revise\', round = ? WHERE scope = ? AND "order" = ?')
+        .run(newRound, scope, order);
       result = { status: "revise", round: newRound };
     }
   });
@@ -429,10 +544,10 @@ function reviseGate(db, scope, seq) {
  */
 function reactivateReviseGate(db, scope) {
   const gate = db.prepare(
-    "SELECT seq FROM scope_gates WHERE scope = ? AND status = 'revise' LIMIT 1"
+    'SELECT "order" FROM gates WHERE scope = ? AND status = \'revise\' LIMIT 1'
   ).get(scope);
   if (!gate) return false;
-  db.prepare("UPDATE scope_gates SET status = 'active' WHERE scope = ? AND seq = ?").run(scope, gate.seq);
+  db.prepare('UPDATE gates SET status = \'active\' WHERE scope = ? AND "order" = ?').run(scope, gate.order);
   return true;
 }
 
@@ -441,47 +556,27 @@ function reactivateReviseGate(db, scope) {
  */
 function hasActiveGates(db, scope) {
   const row = db.prepare(
-    "SELECT 1 FROM scope_gates WHERE scope = ? AND status IN ('pending','active','revise') LIMIT 1"
+    "SELECT 1 FROM gates WHERE scope = ? AND status IN ('pending','active','revise') LIMIT 1"
   ).get(scope);
   return !!row;
 }
 
-// ── Composite operations ──────────────────────────────────────────────
-
-/**
- * Atomic scope registration: ensureScope + setClearedBoolean + setPending.
- * Wraps all three in a single transaction to eliminate partial-write risk.
- */
-function registerScope(db, scope, agent, outputFilepath) {
-  const register = db.transaction(() => {
-    ensureScope(db, scope);
-    setClearedBoolean(db, scope, agent);
-    setPending(db, agent, scope, outputFilepath);
-  });
-  register();
-}
-
 module.exports = {
   getDb,
-  ensureScope,
-  setClearedBoolean,
-  setCleared,
-  getCleared,
+  registerAgent,
+  setVerdict,
+  getAgent,
   isCleared,
-  findClearedScope,
-  setPending,
+  findAgentScope,
   getPending,
+  incrAttempts,
+  getAttempts,
+  resetAttempts,
   addEdit,
   getEdits,
+  getEditCounts,
   addToolHash,
   getLastNHashes,
-  hasMarker,
-  setMarker,
-  deleteMarker,
-  getEditStat,
-  setEditStat,
-  incrEditStat,
-  registerScope,
   migrateFromJson,
   // Gate operations
   initGates,

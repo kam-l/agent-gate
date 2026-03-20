@@ -162,8 +162,8 @@ try {
       process.exit(0);
     }
 
-    // SQLite path — single atomic transaction
-    gatesDb.registerScope(db, scope, agentType, outputFilepath);
+    // SQLite path — single atomic insert/update
+    gatesDb.registerAgent(db, scope, agentType, outputFilepath);
     db.close();
   } else {
     // JSON path (existing behavior)

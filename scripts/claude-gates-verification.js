@@ -139,7 +139,7 @@ function extractArtifactPath(message, sessionDir, agentType) {
  */
 function findClearedScope(sessionDir, agentType, db) {
   if (db) {
-    return gatesDb.findClearedScope(db, agentType);
+    return gatesDb.findAgentScope(db, agentType);
   }
   // JSON fallback
   try {
@@ -162,11 +162,10 @@ function recordVerdict(sessionDir, scope, agentType, verdict, db) {
   try {
     if (db) {
       // SQLite path — atomic read + write
-      const existing = gatesDb.getCleared(db, scope, agentType);
-      const round = (existing && typeof existing === "object" && existing.round) ? existing.round + 1 : 1;
-      const verdictObj = { verdict, round };
-      gatesDb.setCleared(db, scope, agentType, verdictObj);
-      return verdictObj;
+      const existing = gatesDb.getAgent(db, scope, agentType);
+      const round = (existing && existing.round) ? existing.round + 1 : 1;
+      gatesDb.setVerdict(db, scope, agentType, verdict, round);
+      return { verdict, round };
     }
 
     // JSON fallback (existing behavior)
@@ -206,7 +205,7 @@ function validateScopeAndVerify(artifactInfo, verification, sessionDir, agentTyp
       // SQLite path
       if (!gatesDb.isCleared(db, scope, agentType)) {
         // Check if scope exists at all
-        const scopeExists = db.prepare("SELECT 1 FROM scopes WHERE scope = ?").get(scope);
+        const scopeExists = db.prepare("SELECT 1 FROM agents WHERE scope = ?").get(scope);
         if (!scopeExists) {
           block(`Scope "${scope}" not registered. Were you spawned with scope=${scope}?`);
           return;
@@ -424,14 +423,14 @@ function processGateTransitions(db, scope, agentType, finalVerdict, mdContent) {
     const activeGate = gates.find(g => g.gate_agent === agentType && g.status === "active");
     if (activeGate) {
       if (finalVerdict === "PASS" || finalVerdict === "CONVERGED") {
-        const { nextGate, allPassed } = gatesDb.passGate(db, scope, activeGate.seq);
+        const { nextGate, allPassed } = gatesDb.passGate(db, scope, activeGate.order);
         if (allPassed) {
           process.stderr.write(`[ClaudeGates] All gates passed for scope "${scope}". Scope fully unblocked.\n`);
         } else if (nextGate) {
           process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} passed. Next gate: ${nextGate.gate_agent} (spawn with scope=${scope}).\n`);
         }
       } else if (finalVerdict === "REVISE") {
-        const result = gatesDb.reviseGate(db, scope, activeGate.seq);
+        const result = gatesDb.reviseGate(db, scope, activeGate.order);
         if (result && result.status === "failed") {
           process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} exhausted max rounds (${activeGate.max_rounds}). Scope "${scope}" gate chain FAILED.\n`);
         } else if (result) {
