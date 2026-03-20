@@ -30,6 +30,7 @@ try {
 
   const agentType = data.agent_type || "";
   if (!agentType) process.exit(0);
+  const bareAgentType = agentType.includes(":") ? agentType.split(":").pop() : agentType;
 
   const agentId = data.agent_id || "unknown";
   const sessionId = data.session_id || "unknown";
@@ -40,12 +41,12 @@ try {
   // The gater agent definition lives in the plugin's agents/ dir (not .claude/agents/),
   // so findAgentMd won't find it. Extract verdict directly from last_assistant_message
   // and write to session_scopes — plan-gate reads these to allow ExitPlanMode.
-  if (agentType === "gater" && lastMessage) {
+  if (bareAgentType === "gater" && lastMessage) {
     const gaterVerdict = VERDICT_RE.exec(lastMessage);
     if (gaterVerdict) {
       const db = gatesDb.getDb(sessionDir);
       try {
-        recordVerdict(sessionDir, "gater-review", agentType, gaterVerdict[1], db);
+        recordVerdict(sessionDir, "gater-review", bareAgentType, gaterVerdict[1], db);
       } finally {
         if (db) try { db.close(); } catch {}
       }
@@ -54,7 +55,7 @@ try {
   }
 
   // Find agent definition
-  const agentMdPath = findAgentMd(agentType, PROJECT_ROOT, HOME);
+  const agentMdPath = findAgentMd(bareAgentType, PROJECT_ROOT, HOME);
   if (!agentMdPath) process.exit(0);
 
   const mdContent = fs.readFileSync(agentMdPath, "utf-8");

@@ -1759,6 +1759,40 @@ fs.rmSync(tmpGaterHome, { recursive: true, force: true });
 fs.rmSync(tmpGaterHome2, { recursive: true, force: true });
 fs.rmSync(tmpGaterHome3, { recursive: true, force: true });
 
+// Test: plugin-qualified agent_type "claude-gates:gater" → verdict recorded (normalization fix)
+const tmpGaterHome4 = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gater-pq-"));
+const gaterSessionDir4 = path.join(tmpGaterHome4, ".claude", "sessions", "gater-pq-test");
+fs.mkdirSync(gaterSessionDir4, { recursive: true });
+
+const gaterResult4 = runVerification({
+  session_id: "gater-pq-test",
+  agent_type: "claude-gates:gater",
+  agent_id: "gater-4",
+  last_assistant_message: "Reviewed the plan thoroughly.\n\nResult: PASS"
+}, { USERPROFILE: tmpGaterHome4, HOME: tmpGaterHome4 });
+
+assert(gaterResult4.exitCode === 0, "plugin-qualified gater exits 0");
+assert(!gaterResult4.stdout.includes("block"), "plugin-qualified gater does not block");
+
+const gf4Db = gatesDb.getDb(gaterSessionDir4);
+if (gf4Db) {
+  const row4 = gf4Db.prepare(
+    "SELECT verdict FROM cleared WHERE scope = 'gater-review' AND agent = 'gater'"
+  ).get();
+  assert(row4 && row4.verdict === "PASS", "plugin-qualified gater PASS verdict recorded in SQLite");
+  gf4Db.close();
+} else {
+  try {
+    const scopes4 = JSON.parse(fs.readFileSync(path.join(gaterSessionDir4, "session_scopes.json"), "utf-8"));
+    const entry4 = scopes4["gater-review"] && scopes4["gater-review"].cleared && scopes4["gater-review"].cleared.gater;
+    assert(entry4 && entry4.verdict === "PASS", "plugin-qualified gater PASS verdict recorded in JSON");
+  } catch {
+    assert(false, "plugin-qualified gater PASS verdict recorded (no scopes file found)");
+  }
+}
+
+fs.rmSync(tmpGaterHome4, { recursive: true, force: true });
+
 // ── Summary ─────────────────────────────────────────────────────────
 
 console.log(`\n${"=".repeat(50)}`);
