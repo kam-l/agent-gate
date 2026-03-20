@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AgentGate v1 — SubagentStart injection hook.
+ * ClaudeGates v2 — SubagentStart injection hook.
  *
  * Injects output_filepath into agent context so the agent knows exactly
  * where to write its artifact. Reads scope from _pending in

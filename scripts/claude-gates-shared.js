@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * AgentGate v1 — shared module.
+ * ClaudeGates v2 — shared module.
  *
- * Parsers for the two YAML frontmatter fields (requires, verification)
+ * Parsers for YAML frontmatter fields (requires, verification, on_revise, max_rounds)
  * with backward compatibility for the old gate: block schema.
  *
  * Exports:
  *   extractFrontmatter(mdContent)  → string | null
  *   parseRequires(mdContent)       → string[] | null
  *   parseVerification(mdContent)   → string | null
+ *   parseOnRevise(mdContent)       → string | null
+ *   parseMaxRounds(mdContent)      → number | null
  *   findAgentMd(agentType, projectRoot, home) → string | null
  *   VERDICT_RE                     → RegExp
  */
@@ -103,6 +105,28 @@ function parseVerification(mdContent) {
 }
 
 /**
+ * Parse on_revise: field from agent YAML frontmatter.
+ * Returns the designated remediation agent type, or null.
+ */
+function parseOnRevise(mdContent) {
+  const fm = extractFrontmatter(mdContent);
+  if (!fm) return null;
+  const match = fm.match(/^on_revise:\s*["']?([A-Za-z0-9_-]+)["']?\s*$/m);
+  return match ? match[1] : null;
+}
+
+/**
+ * Parse max_rounds: field from agent YAML frontmatter.
+ * Returns the integer value, or null.
+ */
+function parseMaxRounds(mdContent) {
+  const fm = extractFrontmatter(mdContent);
+  if (!fm) return null;
+  const match = fm.match(/^max_rounds:\s*(\d+)\s*$/m);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+/**
  * Find agent .md: project-level first, then global.
  * Returns absolute path or null.
  */
@@ -118,4 +142,4 @@ function findAgentMd(agentType, projectRoot, home) {
   return null;
 }
 
-module.exports = { extractFrontmatter, parseRequires, parseVerification, findAgentMd, VERDICT_RE };
+module.exports = { extractFrontmatter, parseRequires, parseVerification, parseOnRevise, parseMaxRounds, findAgentMd, VERDICT_RE };

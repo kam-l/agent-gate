@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 /**
- * AgentGate v1 — SubagentStop verification hook (BLOCKING).
+ * ClaudeGates v2 — SubagentStop verification hook (BLOCKING).
  *
  * Hybrid enforcement:
  *   Layer 1 (deterministic): file exists, Result: line present, scope registered
  *   Layer 2 (semantic): claude -p judges whether content is substantive
+ *
+ * Verdict recording:
+ *   After verification, records structured verdict objects to session_scopes.json
+ *   with round tracking for retry orchestration (on_revise, max_rounds).
  *
  * Fail-open on infrastructure errors. Hard-block on intentional gates.
  */
@@ -12,7 +16,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { parseVerification, findAgentMd, VERDICT_RE } = require("./agent-gate-shared.js");
+const { parseVerification, parseOnRevise, parseMaxRounds, findAgentMd, VERDICT_RE } = require("./claude-gates-shared.js");
 
 const PROJECT_ROOT = process.cwd();
 const HOME = process.env.USERPROFILE || process.env.HOME || "";
@@ -46,13 +50,13 @@ try {
   const artifactInfo = extractArtifactPath(lastMessage, sessionDir, agentType);
 
   if (artifactInfo) {
-    validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId);
+    validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId, mdContent);
     process.exit(0);
   }
 
   // Path 2: legacy — old gate: schema with .context/tasks/
   try {
-    const compat = require("./agent-gate-compat.js");
+    const compat = require("./claude-gates-compat.js");
     const legacyInfo = compat.extractLegacyArtifactPath(mdContent, PROJECT_ROOT);
     if (legacyInfo) {
       compat.runLegacyVerification(legacyInfo, verification, mdContent, data, PROJECT_ROOT, HOME, runSemanticCheck);
@@ -65,12 +69,12 @@ try {
   if (clearedScope) {
     const expectedPath = path.join(sessionDir, clearedScope, `${agentType}.md`);
     if (fs.existsSync(expectedPath)) {
-      runVerification(expectedPath, clearedScope, verification, sessionDir, agentType, agentId);
+      runVerification(expectedPath, clearedScope, verification, sessionDir, agentType, agentId, mdContent);
       process.exit(0);
     }
     process.stdout.write(JSON.stringify({
       decision: "block",
-      reason: `[AgentGate] Write your artifact to ${sessionDir.replace(/\\/g, "/")}/${clearedScope}/${agentType}.md before stopping. Include a Result: PASS or Result: FAIL line.`
+      reason: `[ClaudeGates] Write your artifact to ${sessionDir.replace(/\\/g, "/")}/${clearedScope}/${agentType}.md before stopping. Include a Result: PASS or Result: FAIL line.`
     }));
     process.exit(0);
   }
@@ -78,7 +82,7 @@ try {
   // No scope, no legacy match → fail-open (ungated usage)
   process.exit(0);
 } catch (err) {
-  process.stderr.write(`[AgentGate verification] Error: ${err.message}\n`);
+  process.stderr.write(`[ClaudeGates verification] Error: ${err.message}\n`);
   process.exit(0); // fail-open
 }
 
@@ -117,9 +121,45 @@ function findClearedScope(sessionDir, agentType) {
 }
 
 /**
+ * Record a structured verdict object to session_scopes.json.
+ * Re-reads the file fresh to minimize stale-data risk.
+ * Returns { verdict, round, max, on_revise } or null on error.
+ */
+function recordVerdict(sessionDir, scope, agentType, verdict, onRevise, maxRounds) {
+  if (!scope || !sessionDir) return null;
+  try {
+    const scopesFile = path.join(sessionDir, "session_scopes.json");
+    let scopes = {};
+    try {
+      scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
+    } catch {} // missing → start fresh
+
+    if (!scopes[scope]) scopes[scope] = { cleared: {} };
+
+    const existing = scopes[scope].cleared[agentType];
+    const round = (existing && typeof existing === "object" && existing.round) ? existing.round + 1 : 1;
+
+    const verdictObj = { verdict, round };
+    if (maxRounds != null) verdictObj.max = maxRounds;
+    if (onRevise != null) verdictObj.on_revise = onRevise;
+
+    scopes[scope].cleared[agentType] = verdictObj;
+
+    if (!fs.existsSync(path.dirname(scopesFile))) {
+      fs.mkdirSync(path.dirname(scopesFile), { recursive: true });
+    }
+    fs.writeFileSync(scopesFile, JSON.stringify(scopes, null, 2), "utf-8");
+
+    return verdictObj;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Validate scope registration then run verification.
  */
-function validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId) {
+function validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId, mdContent) {
   const { artifactPath, scope } = artifactInfo;
 
   // Validate scope against session_scopes.json
@@ -142,13 +182,13 @@ function validateScopeAndVerify(artifactInfo, verification, sessionDir, agentTyp
     return;
   }
 
-  runVerification(artifactPath, scope, verification, sessionDir, agentType, agentId);
+  runVerification(artifactPath, scope, verification, sessionDir, agentType, agentId, mdContent);
 }
 
 /**
  * Layer 1 (deterministic) + Layer 2 (semantic) verification.
  */
-function runVerification(artifactPath, scope, verification, sessionDir, agentType, agentId) {
+function runVerification(artifactPath, scope, verification, sessionDir, agentType, agentId, mdContent) {
   const artifactContent = fs.readFileSync(artifactPath, "utf-8");
 
   // Layer 1: Result: line must exist
@@ -172,14 +212,21 @@ function runVerification(artifactPath, scope, verification, sessionDir, agentTyp
   }
 
   // Layer 2: semantic verification
-  runSemanticCheck(verification, artifactContent, artifactPath, contextContent, agentType, agentId, null, scope, sessionDir);
+  runSemanticCheck(verification, artifactContent, artifactPath, contextContent, agentType, agentId, null, scope, sessionDir, mdContent);
 }
 
 /**
  * Run claude -p semantic validation.
  * Uses stdin pipe — no shell expansion, no injection risk.
+ *
+ * Verdict precedence:
+ *   1. Semantic checker says FAIL → verdict = FAIL (quality gate)
+ *   2. Else → use artifact's Result: line (PASS/FAIL/REVISE/CONVERGED)
+ *   3. No match → "UNKNOWN", allow (fail-open)
+ *
+ * mdContent (last param) is optional — legacy compat path omits it.
  */
-function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent, agentType, agentId, sessionId, scope, sessionDir) {
+function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent, agentType, agentId, sessionId, scope, sessionDir, mdContent) {
   const resolvedSessionDir = sessionDir || (sessionId ? path.join(HOME, ".claude", "sessions", sessionId) : null);
 
   let combinedPrompt = prompt + "\n\n";
@@ -204,10 +251,10 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
     return; // fail-open
   }
 
-  // Parse last line for PASS/FAIL
+  // Parse last line for PASS/FAIL from semantic checker
   const lines = result.split("\n").filter(l => l.trim());
   const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : "";
-  const verdictMatch = /^(PASS|FAIL)(?:[:\s\u2014\u2013-]+(.*))?$/i.exec(lastLine);
+  const semanticMatch = /^(PASS|FAIL)(?:[:\s\u2014\u2013-]+(.*))?$/i.exec(lastLine);
 
   // Write audit trail
   const auditDir = scope && resolvedSessionDir ? path.join(resolvedSessionDir, scope) : resolvedSessionDir;
@@ -219,31 +266,62 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
         : path.join(auditDir, `${agentType}_${agentId}.md`);
       fs.writeFileSync(
         auditFile,
-        `# AgentGate: ${agentType}\n` +
+        `# ClaudeGates: ${agentType}\n` +
         `- **Timestamp:** ${new Date().toISOString()}\n` +
         `- **Artifact:** ${artifactPath.replace(/\\/g, "/")}\n` +
         (scope ? `- **Scope:** ${scope}\n` : "") +
-        `- **Verdict:** ${verdictMatch ? verdictMatch[1].toUpperCase() : "UNKNOWN"}\n` +
-        `- **Reason:** ${verdictMatch && verdictMatch[2] ? verdictMatch[2].trim() : "N/A"}\n` +
+        `- **Verdict:** ${semanticMatch ? semanticMatch[1].toUpperCase() : "UNKNOWN"}\n` +
+        `- **Reason:** ${semanticMatch && semanticMatch[2] ? semanticMatch[2].trim() : "N/A"}\n` +
         `- **Full response:**\n\`\`\`\n${result}\n\`\`\`\n`,
         "utf-8"
       );
     } catch {} // non-fatal
   }
 
-  if (verdictMatch && verdictMatch[1].toUpperCase() === "FAIL") {
-    const reason = verdictMatch[2] ? verdictMatch[2].trim() : "Semantic validation failed";
+  // ── Verdict precedence ──
+  // 1. Semantic checker FAIL → hard block (quality gate)
+  // 2. Else → use artifact's Result: line as authoritative verdict
+  // 3. No match → UNKNOWN, allow (fail-open)
+
+  let finalVerdict = "UNKNOWN";
+
+  if (semanticMatch && semanticMatch[1].toUpperCase() === "FAIL") {
+    finalVerdict = "FAIL";
+  } else {
+    // Use artifact's own Result: line
+    const artifactVerdictMatch = VERDICT_RE.exec(artifactContent);
+    if (artifactVerdictMatch) {
+      finalVerdict = artifactVerdictMatch[1].toUpperCase();
+    }
+  }
+
+  // Record verdict to session_scopes.json
+  const onRevise = parseOnRevise(mdContent);
+  const maxRounds = parseMaxRounds(mdContent);
+  const verdictObj = recordVerdict(resolvedSessionDir, scope, agentType, finalVerdict, onRevise, maxRounds);
+
+  if (verdictObj) {
+    const maxStr = verdictObj.max ? `/${verdictObj.max}` : "";
+    const reviseStr = verdictObj.on_revise ? ` Designated remediation: ${verdictObj.on_revise}.` : "";
+    process.stderr.write(`[ClaudeGates] Verdict: ${finalVerdict} (round ${verdictObj.round}${maxStr}).${reviseStr}\n`);
+  }
+
+  // Only FAIL blocks; REVISE/CONVERGED/PASS/UNKNOWN allow
+  if (finalVerdict === "FAIL") {
+    const reason = semanticMatch && semanticMatch[2] ? semanticMatch[2].trim() : "Semantic validation failed";
     block(`Your ${path.basename(artifactPath)} failed semantic validation: ${reason}. Rewrite it with substantive content.`);
     return;
   }
 
-  // PASS or unparseable → allow (fail-open)
-  process.stderr.write(`[AgentGate] ${agentType}: ${lastLine}\n`);
+  // PASS/REVISE/CONVERGED/UNKNOWN → allow (orchestrator reads session_scopes.json for retry decisions)
+  if (!verdictObj) {
+    process.stderr.write(`[ClaudeGates] ${agentType}: ${lastLine}\n`);
+  }
 }
 
 /**
  * Output a block decision.
  */
 function block(reason) {
-  process.stdout.write(JSON.stringify({ decision: "block", reason: `[AgentGate] ${reason}` }));
+  process.stdout.write(JSON.stringify({ decision: "block", reason: `[ClaudeGates] ${reason}` }));
 }

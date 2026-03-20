@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AgentGate v1 — PreToolUse:Agent conditions hook.
+ * ClaudeGates v2 — PreToolUse:Agent conditions hook.
  *
  * Checks `requires:` dependencies before allowing an agent to spawn.
  * Extracts `scope=<name>` from the agent's prompt to locate scope directory.
@@ -22,7 +22,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { parseRequires, findAgentMd } = require("./agent-gate-shared.js");
+const { parseRequires, findAgentMd } = require("./claude-gates-shared.js");
 
 const HOME = process.env.USERPROFILE || process.env.HOME || "";
 const PROJECT_ROOT = process.cwd();
@@ -74,7 +74,7 @@ try {
     if (missing.length > 0) {
       process.stdout.write(JSON.stringify({
         decision: "block",
-        reason: `[AgentGate] Cannot spawn ${agentType}: missing ${missing.map(m => m + ".md").join(", ")} in ${scope}/. Spawn ${missing.join(", ")} first.`
+        reason: `[ClaudeGates] Cannot spawn ${agentType}: missing ${missing.map(m => m + ".md").join(", ")} in ${scope}/. Spawn ${missing.join(", ")} first.`
       }));
       process.exit(0);
     }
@@ -93,7 +93,9 @@ try {
   } catch {} // missing or invalid → start fresh
 
   if (!scopes[scope]) scopes[scope] = { cleared: {} };
-  scopes[scope].cleared[agentType] = true;
+  if (!scopes[scope].cleared[agentType]) {
+    scopes[scope].cleared[agentType] = true;
+  }
 
   // Stage output_filepath for injection hook (SubagentStart reads this)
   const outputFilepath = path.join(scopeDir, `${agentType}.md`).replace(/\\/g, "/");
@@ -110,6 +112,6 @@ try {
   process.exit(0);
 } catch (err) {
   // Fail-open
-  process.stderr.write(`[AgentGate conditions] Error: ${err.message}\n`);
+  process.stderr.write(`[ClaudeGates conditions] Error: ${err.message}\n`);
   process.exit(0);
 }

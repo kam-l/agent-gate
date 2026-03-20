@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AgentGate v1 — legacy compatibility module.
+ * ClaudeGates v2 — legacy compatibility module.
  *
  * Handles the old gate: schema from project-level agent definitions
  * that use {task_dir} interpolation and .context/tasks/ conventions.
@@ -15,7 +15,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { extractFrontmatter, VERDICT_RE } = require("./agent-gate-shared.js");
+const { extractFrontmatter, VERDICT_RE } = require("./claude-gates-shared.js");
 
 /**
  * Highest-numbered dir under {projectRoot}/.context/tasks/, or null.
@@ -101,7 +101,7 @@ function runLegacyVerification(legacyInfo, verification, mdContent, data, projec
   if (gate && gate.verdict && !VERDICT_RE.test(artifactContent)) {
     process.stdout.write(JSON.stringify({
       decision: "block",
-      reason: `[AgentGate] Your ${artifactName} is missing a Result: line. Add 'Result: PASS' or 'Result: FAIL' as a standalone line.`
+      reason: `[ClaudeGates] Your ${artifactName} is missing a Result: line. Add 'Result: PASS' or 'Result: FAIL' as a standalone line.`
     }));
     return;
   }
