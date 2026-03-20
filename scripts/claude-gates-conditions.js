@@ -2,28 +2,29 @@
 /**
  * ClaudeGates v2 — PreToolUse:Agent conditions hook.
  *
- * Checks `requires:` dependencies before allowing an agent to spawn.
- * Extracts `scope=<name>` from the agent's prompt to locate scope directory.
+ * Checks `requires:` dependencies and `gates:` chain enforcement before
+ * allowing an agent to spawn. Extracts `scope=<name>` from the agent's prompt.
  *
  * Flow:
  *   1. Resume? → allow (no gating on resumed agents)
- *   2. Extract scope from prompt (regex: scope=([A-Za-z0-9_-]+))
- *   3. No scope? → allow (ungated agent, backward compatible)
- *   4. Find agent .md → parse requires:
- *   5. No requires → allow
- *   6. For each required type: check {session_dir}/{scope}/{type}.md exists
- *   7. Missing → exit 2: "Missing {type}.md — spawn {type} first"
- *   8. All exist → allow
- *
- * Also: creates scope dir, registers scope + cleared agent in session_scopes.json.
+ *   2. No agent type? → allow
+ *   3. Find agent .md → parse frontmatter
+ *   4. No agent .md? → allow (no gate definition)
+ *   5. Has CG fields (gates/requires/conditions) but no scope? → BLOCK
+ *   6. No scope? → allow (ungated agent, backward compatible)
+ *   7. Requires check: all required artifacts must exist in scope dir
+ *   8. Conditions: semantic pre-check via claude -p (if conditions: field present)
+ *   9. Gate enforcement: active gate → only that gate agent; revise → only source agent
+ *  10. Register scope + cleared + pending
  *
  * Fail-open.
  */
 
 const fs = require("fs");
 const path = require("path");
-const { parseRequires, findAgentMd } = require("./claude-gates-shared.js");
-const { getDb, registerScope } = require("./claude-gates-db.js");
+const { execSync } = require("child_process");
+const { parseRequires, parseConditions, requiresScope, findAgentMd } = require("./claude-gates-shared.js");
+const gatesDb = require("./claude-gates-db.js");
 
 const HOME = process.env.USERPROFILE || process.env.HOME || "";
 const PROJECT_ROOT = process.cwd();
@@ -39,18 +40,36 @@ try {
   // Resume → allow (no gating)
   if (toolInput.resume) process.exit(0);
 
+  // No agent type → allow
+  if (!agentType) process.exit(0);
+
+  // Find agent definition early (needed for scope-required check)
+  const agentMdPath = findAgentMd(agentType, PROJECT_ROOT, HOME);
+  let mdContent = null;
+  if (agentMdPath) {
+    mdContent = fs.readFileSync(agentMdPath, "utf-8");
+  }
+
   // Extract scope
   const scopeMatch = prompt.match(/scope=([A-Za-z0-9_-]+)/);
   const scope = scopeMatch ? scopeMatch[1] : null;
 
-  // No scope → ungated, allow
-  if (!scope) process.exit(0);
+  // No scope handling
+  if (!scope) {
+    if (mdContent && requiresScope(mdContent)) {
+      process.stdout.write(JSON.stringify({
+        decision: "block",
+        reason: `[ClaudeGates] Agent "${agentType}" has gates/requires fields but was spawned without scope=<name>. Add scope=<name> to the prompt.`
+      }));
+    }
+    process.exit(0);
+  }
 
-  // Reject reserved scope names (collide with internal keys in session_scopes.json)
+  // Reject reserved scope names
   if (scope === "_pending") process.exit(0);
 
-  // No agent type → allow
-  if (!agentType) process.exit(0);
+  // No agent .md → no gate
+  if (!agentMdPath || !mdContent) process.exit(0);
 
   // Session dir
   const sessionId = data.session_id || "";
@@ -58,11 +77,7 @@ try {
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId);
   const scopeDir = path.join(sessionDir, scope);
 
-  // Find agent definition and parse requires
-  const agentMdPath = findAgentMd(agentType, PROJECT_ROOT, HOME);
-  if (!agentMdPath) process.exit(0); // no agent .md → no gate
-
-  const mdContent = fs.readFileSync(agentMdPath, "utf-8");
+  // Parse requires
   const requires = parseRequires(mdContent);
 
   // Check all required artifacts exist
@@ -81,6 +96,40 @@ try {
     }
   }
 
+  // ── Semantic pre-check (conditions:) ──
+  const conditions = parseConditions(mdContent);
+  if (conditions) {
+    try {
+      const condPrompt = conditions + "\n\nAgent spawn prompt:\n" + prompt;
+      const condResult = execSync(
+        "claude -p --model sonnet --max-turns 1",
+        {
+          input: condPrompt,
+          cwd: PROJECT_ROOT,
+          timeout: 30000,
+          encoding: "utf-8",
+          shell: true,
+          env: { ...process.env, CLAUDECODE: "" }
+        }
+      ).trim();
+      const condLines = condResult.split("\n").filter(l => l.trim());
+      const condLast = condLines.length > 0 ? condLines[condLines.length - 1].trim() : "";
+      const condMatch = /^(PASS|FAIL)(?:[:\s\u2014\u2013-]+(.*))?$/i.exec(condLast);
+      if (condMatch && condMatch[1].toUpperCase() === "FAIL") {
+        const reason = condMatch[2] ? condMatch[2].trim() : "Pre-spawn conditions check failed";
+        process.stdout.write(JSON.stringify({
+          decision: "block",
+          reason: `[ClaudeGates] Conditions check failed for ${agentType}: ${reason}`
+        }));
+        process.exit(0);
+      }
+      process.stderr.write(`[ClaudeGates] Conditions: ${condMatch ? condMatch[1].toUpperCase() : "UNKNOWN"} for ${agentType}\n`);
+    } catch {
+      // Semantic check failed — fail-open
+      process.stderr.write(`[ClaudeGates] Conditions check skipped for ${agentType} (claude -p unavailable)\n`);
+    }
+  }
+
   // Create scope dir if first agent
   if (!fs.existsSync(scopeDir)) {
     fs.mkdirSync(scopeDir, { recursive: true });
@@ -89,10 +138,32 @@ try {
   const outputFilepath = path.join(scopeDir, `${agentType}.md`).replace(/\\/g, "/");
 
   // Dual-path: SQLite (atomic) or JSON (fallback)
-  const db = getDb(sessionDir);
+  const db = gatesDb.getDb(sessionDir);
   if (db) {
+    // ── Gate enforcement (SQLite only) ──
+    const activeGate = gatesDb.getActiveGate(db, scope);
+    const reviseGate = gatesDb.getReviseGate(db, scope);
+
+    if (activeGate && agentType !== activeGate.gate_agent) {
+      process.stdout.write(JSON.stringify({
+        decision: "block",
+        reason: `[ClaudeGates] Scope "${scope}" has active gate: ${activeGate.gate_agent} (round ${activeGate.round}/${activeGate.max_rounds}). Spawn ${activeGate.gate_agent} with scope=${scope}.`
+      }));
+      db.close();
+      process.exit(0);
+    }
+
+    if (reviseGate && agentType !== reviseGate.source_agent) {
+      process.stdout.write(JSON.stringify({
+        decision: "block",
+        reason: `[ClaudeGates] Scope "${scope}" gate "${reviseGate.gate_agent}" returned REVISE. Resume source agent "${reviseGate.source_agent}" with scope=${scope} to fix, then re-run the gate.`
+      }));
+      db.close();
+      process.exit(0);
+    }
+
     // SQLite path — single atomic transaction
-    registerScope(db, scope, agentType, outputFilepath);
+    gatesDb.registerScope(db, scope, agentType, outputFilepath);
     db.close();
   } else {
     // JSON path (existing behavior)

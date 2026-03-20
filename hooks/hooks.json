@@ -18,6 +18,11 @@
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/loop-gate.js",
             "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/commit-gate.js",
+            "timeout": 130000
           }
         ]
       },
@@ -92,15 +97,6 @@
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/claude-gates-verification.js",
             "timeout": 120000
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/adversary-stamp.js",
-            "timeout": 5000
           }
         ]
       }

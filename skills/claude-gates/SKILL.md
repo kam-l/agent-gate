@@ -1,5 +1,5 @@
 ---
-description: "ClaudeGates v2 — declarative pipeline gates. Use when spawning gated agents, debugging gate failures, writing agent definitions with requires:/verification:/on_revise:/max_rounds: fields, or understanding pipeline ordering. Triggers on: 'gate failed', 'agent blocked', 'missing artifact', 'requires not met', 'verification failed', 'scope=', 'session_scopes', 'claude-gates', 'pipeline ordering', 'writing an agent', 'requires: field', 'verification: field', 'on_revise: field', 'max_rounds: field', 'how do I gate', 'agent frontmatter', 'Result: PASS', 'Result: FAIL', 'Result: REVISE', 'Result: CONVERGED', 'SubagentStop', 'SubagentStart', 'edit-gate', 'stop-gate', 'loop-gate', 'verdict object'."
+description: "ClaudeGates v2 — declarative pipeline gates. Use when spawning gated agents, debugging gate failures, writing agent definitions with requires:/verification:/conditions:/gates: fields, or understanding pipeline ordering. Triggers on: 'gate failed', 'agent blocked', 'missing artifact', 'requires not met', 'verification failed', 'scope=', 'session_scopes', 'claude-gates', 'pipeline ordering', 'writing an agent', 'requires: field', 'verification: field', 'conditions: field', 'gates: field', 'how do I gate', 'agent frontmatter', 'Result: PASS', 'Result: FAIL', 'Result: REVISE', 'Result: CONVERGED', 'SubagentStop', 'SubagentStart', 'edit-gate', 'stop-gate', 'loop-gate', 'verdict object', 'gate chain', 'post-completion gates'."
 user-invocable: false
 ---
 
@@ -18,22 +18,37 @@ requires: ["implementer", "cleaner"]
 verification: |
   Evaluate whether this demonstrates genuine critical analysis.
   Reply EXACTLY on the last line: PASS or FAIL followed by your reason.
-on_revise: fixer
-max_rounds: 3
 ---
 ```
 
 **Fields:**
-- `requires:` — list of agent types that must complete first
-- `verification:` — prompt for semantic quality check (claude -p)
-- `on_revise:` — agent type to spawn for remediation on REVISE verdict
-- `max_rounds:` — maximum retry rounds before escalation
+- `conditions:` — semantic PRE-check before agent spawns (claude -p, requires scope). Blocks if FAIL.
+- `requires:` — list of agent types that must complete first (requires scope)
+- `verification:` — semantic POST-check after agent completes (claude -p)
+- `gates:` — ordered post-completion gate chain (requires scope). Format: `- [agent_type, max_rounds]`
 
 **Artifact path**: `~/.claude/sessions/{session_id}/{scope}/{agent_type}.md`
 
 ## Orchestrator Contract
 
-Include `scope=<name>` in spawn prompt. No scope = ungated (backward compatible).
+Include `scope=<name>` in spawn prompt. **Required** for agents with `gates:` or `requires:` fields (blocked otherwise). No scope = ungated for agents with only `verification:`.
+
+### Gate Chain (`gates:` field)
+
+```yaml
+---
+name: implementer
+gates:
+  - [reviewer, 3]
+  - [playtester, 3]
+---
+```
+
+After source agent completes (PASS/CONVERGED), gates are enforced in order:
+1. Conditions hook blocks all spawns in scope except the active gate agent
+2. Gate agent PASS → advance to next gate. All gates passed → scope unblocked
+3. Gate agent REVISE → source agent must re-run, then gate re-runs (max N rounds)
+4. Gate agent FAIL → semantic layer blocks rewrite (no state change)
 
 ```
 Agent({ subagent_type: "reviewer", prompt: "scope=task-1 Review the spec..." })
@@ -63,16 +78,14 @@ After verification, `session_scopes.json` stores structured verdict objects:
     "cleared": {
       "reviewer": {
         "verdict": "PASS",
-        "round": 1,
-        "max": 3,
-        "on_revise": "fixer"
+        "round": 1
       }
     }
   }
 }
 ```
 
-Backward-compatible: `if (cleared[agentType])` works for both `true` (v1) and verdict objects (v2).
+`if (cleared[agentType])` works for both `true` (initial clear) and verdict objects (after verification).
 
 ## Hooks
 
@@ -81,13 +94,11 @@ Backward-compatible: `if (cleared[agentType])` works for both `true` (v1) and ve
 | `claude-gates-conditions.js` | PreToolUse:Agent | Checks `requires:` deps, stages `output_filepath` in `_pending` |
 | `claude-gates-injection.js` | SubagentStart | Injects `output_filepath` via `<agent_gate>` tag |
 | `claude-gates-verification.js` | SubagentStop | Structural + semantic validation on stop |
-| `edit-gate.js` | PostToolUse:Edit\|Write | Tracks edited files to `edits.log` |
+| `plan-gate.js` | PreToolUse:ExitPlanMode | Verdict-based: checks for gater PASS in session_scopes |
+| `commit-gate.js` | PreToolUse:Bash | Pre-commit validation (opt-in via `claude-gates.json`) |
+| `edit-gate.js` | PostToolUse:Edit\|Write | Tracks edited files, configurable thresholds |
 | `loop-gate.js` | PreToolUse:Bash\|Edit\|Write | Breaks infinite loops of identical tool calls |
-| `stop-gate.js` | Stop | Scans edited files for debug leftovers |
-
-## Legacy Compatibility
-
-Old `gate:` schema (artifact/required/verdict/prompt/context) still works via `claude-gates-compat.js`.
+| `stop-gate.js` | Stop | Configurable debug scan + custom commands |
 
 ## Troubleshooting
 
@@ -98,5 +109,9 @@ Old `gate:` schema (artifact/required/verdict/prompt/context) still works via `c
 | "Missing Result: line" | Add `Result: PASS` or `Result: FAIL` as standalone line |
 | "Failed semantic validation" | Rewrite with substantive analysis |
 | Agent runs ungated | Add `scope=<name>` to spawn prompt |
-| "Debug leftovers found" | Remove TODO/HACK/FIXME/console.log or stop again to proceed |
+| "has gates/requires fields but no scope" | Add `scope=<name>` — required for agents with `gates:` or `requires:` |
+| "has active gate: X" | Spawn the named gate agent with the same scope |
+| "gate returned REVISE" | Resume/re-spawn the source agent to fix, then gate re-runs |
+| "Debug leftovers found" | Remove flagged patterns or stop again (nudge mode) / ignore (warn mode) |
+| "Pre-commit check failed" | Fix validation command failures before committing |
 | "Blocked: identical tool call" | Change your approach — same call was made 3 times |

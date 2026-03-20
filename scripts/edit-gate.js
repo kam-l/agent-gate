@@ -5,7 +5,7 @@
  * Tracks edited files and nudges when uncommitted changes exceed thresholds.
  * Never blocks — stderr nudge only.
  *
- * Thresholds (pinned): 10 unique files OR 200 net added lines.
+ * Thresholds configurable via claude-gates.json (defaults: 10 files, 200 lines).
  * Git stats computed lazily every 5th unique file (not on every edit).
  *
  * Fail-open.
@@ -15,9 +15,11 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 const { getDb, addEdit, getEdits, getEditStat, setEditStat, incrEditStat } = require("./claude-gates-db.js");
+const { loadConfig } = require("./claude-gates-config.js");
 
-const FILE_THRESHOLD = 10;
-const LINE_THRESHOLD = 200;
+const config = loadConfig();
+const FILE_THRESHOLD = config.edit_gate.file_threshold;
+const LINE_THRESHOLD = config.edit_gate.line_threshold;
 const CHECK_INTERVAL = 5; // compute git stats every Nth unique file
 
 try {

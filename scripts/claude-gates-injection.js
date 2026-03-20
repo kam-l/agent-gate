@@ -6,12 +6,14 @@
  * where to write its artifact. Reads scope from _pending in
  * session_scopes.json (staged by the conditions hook).
  *
+ * For gate agents, enhances context with source agent info.
+ *
  * Fail-open.
  */
 
 const fs = require("fs");
 const path = require("path");
-const { getDb, getPending } = require("./claude-gates-db.js");
+const { getDb, getPending, getActiveGate } = require("./claude-gates-db.js");
 
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -24,16 +26,34 @@ try {
 
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId).replace(/\\/g, "/");
 
-  // Read output_filepath from pending state (staged by conditions hook)
+  // Read output_filepath and gate context from DB or JSON
   let outputFilepath = "";
+  let gateContext = "";
   const db = getDb(sessionDir);
   if (db) {
-    // SQLite path
-    const pending = getPending(db, agentType);
-    if (pending && pending.outputFilepath) {
-      outputFilepath = pending.outputFilepath;
+    try {
+      // SQLite path
+      const pending = getPending(db, agentType);
+      if (pending && pending.outputFilepath) {
+        outputFilepath = pending.outputFilepath;
+        // Check if this is a gate agent
+        if (pending.scope) {
+          const activeGate = getActiveGate(db, pending.scope);
+          if (activeGate && activeGate.gate_agent === agentType) {
+            const sourceArtifact = path.join(
+              sessionDir, pending.scope, `${activeGate.source_agent}.md`
+            ).replace(/\\/g, "/");
+            gateContext =
+              `role=gate\n` +
+              `source_agent=${activeGate.source_agent}\n` +
+              `source_artifact=${sourceArtifact}\n` +
+              `gate_round=${activeGate.round}/${activeGate.max_rounds}\n`;
+          }
+        }
+      }
+    } finally {
+      db.close();
     }
-    db.close();
   } else {
     // JSON path (existing behavior)
     try {
@@ -51,6 +71,7 @@ try {
     context =
       `<agent_gate importance="critical">\n` +
       `output_filepath=${outputFilepath}\n` +
+      gateContext +
       `Write your artifact to this exact path. Last line must be: Result: PASS or Result: FAIL\n` +
       `</agent_gate>`;
   } else {

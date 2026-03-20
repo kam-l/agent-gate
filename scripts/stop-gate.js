@@ -4,9 +4,12 @@
  *
  * 1. Artifact completeness: warns about agents with no verdict or REVISE verdict
  *    in scopes where other agents have completed (PASS/CONVERGED).
- * 2. Debug leftovers: scans edit-gate's file list for common debug markers.
+ * 2. Debug leftovers: scans edit-gate's file list for configurable debug markers.
+ * 3. Custom commands: runs configured validation commands.
  *
- * Once-only nudge: blocks first time, passes on second stop.
+ * Mode (via claude-gates.json):
+ *   "warn"  (default) — stderr only, no block
+ *   "nudge" — blocks first time, passes on second stop
  *
  * Fail-open.
  */
@@ -15,6 +18,7 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 const { getDb, hasMarker, getEdits, setMarker } = require("./claude-gates-db.js");
+const { loadConfig } = require("./claude-gates-config.js");
 
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -105,20 +109,20 @@ try {
     if (files.length === 0 && issues.length === 0) process.exit(0);
   }
 
-  // ── Debug leftover scan ──
-  const PATTERNS = [
-    { name: "TODO", re: /\bTODO\b/ },
-    { name: "HACK", re: /\bHACK\b/ },
-    { name: "FIXME", re: /\bFIXME\b/ },
-    { name: "console.log", re: /\bconsole\.log\b/ }
-  ];
+  // ── Debug leftover scan (configurable patterns) ──
+  const config = loadConfig();
+  const PATTERNS = (config.stop_gate.patterns || []).map(p => ({
+    name: p,
+    re: new RegExp(p.includes(".") ? p.replace(/\./g, "\\.") : `\\b${p}\\b`)
+  }));
 
   const MAX_LINES = 5000;
   const matches = [];
 
   for (const filePath of files) {
-    // Skip deleted files
+    // Skip deleted files and test files
     if (!fs.existsSync(filePath)) continue;
+    if (/[-.]test\b|\.spec\b|\btest[s]?\//i.test(filePath)) continue;
 
     let linesToCheck;
 
@@ -159,21 +163,19 @@ try {
     }
   }
 
+  // ── Run configured commands ──
+  for (const cmd of config.stop_gate.commands || []) {
+    try {
+      execSync(cmd, { encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] });
+    } catch (err) {
+      const output = (err.stderr || err.stdout || "").trim().split("\n").slice(0, 3).join("; ");
+      issues.push(`  Command failed: ${cmd}${output ? " — " + output : ""}`);
+    }
+  }
+
   if (matches.length === 0 && issues.length === 0) {
     if (db) db.close();
     process.exit(0);
-  }
-
-  // Create marker so second stop passes
-  if (db) {
-    try { setMarker(db, "stop-gate-nudged", new Date().toISOString()); } catch {} // non-fatal
-    db.close();
-  } else {
-    try {
-      const markerFile = path.join(sessionDir, ".stop-gate-nudged");
-      if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-      fs.writeFileSync(markerFile, new Date().toISOString(), "utf-8");
-    } catch {} // non-fatal
   }
 
   // Build summary (cap at 10 entries each)
@@ -190,10 +192,29 @@ try {
     parts.push(`Debug leftovers found:\n${debugSummary}`);
   }
 
-  process.stdout.write(JSON.stringify({
-    decision: "block",
-    reason: `[ClaudeGates] ${parts.join("\n")}\nClean up or stop again to proceed.`
-  }));
+  const summary = parts.join("\n");
+
+  if (config.stop_gate.mode === "nudge") {
+    // Block-once: set marker so second stop passes
+    if (db) {
+      try { setMarker(db, "stop-gate-nudged", new Date().toISOString()); } catch {}
+      db.close();
+    } else {
+      try {
+        const markerFile = path.join(sessionDir, ".stop-gate-nudged");
+        if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+        fs.writeFileSync(markerFile, new Date().toISOString(), "utf-8");
+      } catch {}
+    }
+    process.stdout.write(JSON.stringify({
+      decision: "block",
+      reason: `[ClaudeGates] ${summary}\nClean up or stop again to proceed.`
+    }));
+  } else {
+    // Warn mode (default): stderr only, no block
+    if (db) db.close();
+    process.stderr.write(`[ClaudeGates] ${summary}\n`);
+  }
   process.exit(0);
 } catch {
   process.exit(0); // fail-open

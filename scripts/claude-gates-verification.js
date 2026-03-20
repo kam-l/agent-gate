@@ -8,7 +8,7 @@
  *
  * Verdict recording:
  *   After verification, records structured verdict objects to session_scopes.json
- *   with round tracking for retry orchestration (on_revise, max_rounds).
+ *   with round tracking.
  *
  * Fail-open on infrastructure errors. Hard-block on intentional gates.
  */
@@ -16,7 +16,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { parseVerification, parseOnRevise, parseMaxRounds, findAgentMd, VERDICT_RE } = require("./claude-gates-shared.js");
+const { parseVerification, parseGates, findAgentMd, VERDICT_RE } = require("./claude-gates-shared.js");
 const gatesDb = require("./claude-gates-db.js");
 
 const PROJECT_ROOT = process.cwd();
@@ -42,9 +42,11 @@ try {
 
   const mdContent = fs.readFileSync(agentMdPath, "utf-8");
   const verification = parseVerification(mdContent);
+  const agentGates = parseGates(mdContent);
 
-  // No verification prompt → no gate
-  if (!verification) process.exit(0);
+  // No verification prompt AND no gates → no gate
+  if (!verification && !agentGates) process.exit(0);
+
 
   // Open DB (null if better-sqlite3 unavailable → JSON fallback)
   const db = gatesDb.getDb(sessionDir);
@@ -55,26 +57,25 @@ try {
     const artifactInfo = extractArtifactPath(lastMessage, sessionDir, agentType);
 
     if (artifactInfo) {
-      validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId, mdContent, db);
+      if (verification) {
+        validateScopeAndVerify(artifactInfo, verification, sessionDir, agentType, agentId, mdContent, db);
+      } else {
+        // Gates-only: structural check + gate transitions, no semantic verification
+        runGatesOnlyCheck(artifactInfo, sessionDir, agentType, mdContent, db);
+      }
       process.exit(0);
     }
 
-    // Path 2: legacy — old gate: schema with .context/tasks/
-    try {
-      const compat = require("./claude-gates-compat.js");
-      const legacyInfo = compat.extractLegacyArtifactPath(mdContent, PROJECT_ROOT);
-      if (legacyInfo) {
-        compat.runLegacyVerification(legacyInfo, verification, mdContent, data, PROJECT_ROOT, HOME, runSemanticCheck);
-        process.exit(0);
-      }
-    } catch {} // compat module missing → skip legacy path
-
-    // Path 3: scope lookup — agent was cleared but path not in message
+    // Path 2: scope lookup — agent was cleared but path not in message
     const clearedScope = findClearedScope(sessionDir, agentType, db);
     if (clearedScope) {
       const expectedPath = path.join(sessionDir, clearedScope, `${agentType}.md`);
       if (fs.existsSync(expectedPath)) {
-        runVerification(expectedPath, clearedScope, verification, sessionDir, agentType, agentId, mdContent, db);
+        if (verification) {
+          runVerification(expectedPath, clearedScope, verification, sessionDir, agentType, agentId, mdContent, db);
+        } else {
+          runGatesOnlyCheck({ artifactPath: expectedPath, scope: clearedScope }, sessionDir, agentType, mdContent, db);
+        }
         process.exit(0);
       }
       process.stdout.write(JSON.stringify({
@@ -84,7 +85,7 @@ try {
       process.exit(0);
     }
 
-    // No scope, no legacy match → fail-open (ungated usage)
+    // No scope match → fail-open (ungated usage)
     process.exit(0);
   } finally {
     if (db) try { db.close(); } catch {}
@@ -136,20 +137,16 @@ function findClearedScope(sessionDir, agentType, db) {
 /**
  * Record a structured verdict object.
  * Dual-path: SQLite (atomic) or JSON (read-modify-write fallback).
- * Returns { verdict, round, max, on_revise } or null on error.
+ * Returns { verdict, round } or null on error.
  */
-function recordVerdict(sessionDir, scope, agentType, verdict, onRevise, maxRounds, db) {
+function recordVerdict(sessionDir, scope, agentType, verdict, db) {
   if (!scope || !sessionDir) return null;
   try {
     if (db) {
       // SQLite path — atomic read + write
       const existing = gatesDb.getCleared(db, scope, agentType);
       const round = (existing && typeof existing === "object" && existing.round) ? existing.round + 1 : 1;
-
       const verdictObj = { verdict, round };
-      if (maxRounds != null) verdictObj.max = maxRounds;
-      if (onRevise != null) verdictObj.on_revise = onRevise;
-
       gatesDb.setCleared(db, scope, agentType, verdictObj);
       return verdictObj;
     }
@@ -165,11 +162,7 @@ function recordVerdict(sessionDir, scope, agentType, verdict, onRevise, maxRound
 
     const existing = scopes[scope].cleared[agentType];
     const round = (existing && typeof existing === "object" && existing.round) ? existing.round + 1 : 1;
-
     const verdictObj = { verdict, round };
-    if (maxRounds != null) verdictObj.max = maxRounds;
-    if (onRevise != null) verdictObj.on_revise = onRevise;
-
     scopes[scope].cleared[agentType] = verdictObj;
 
     if (!fs.existsSync(path.dirname(scopesFile))) {
@@ -266,7 +259,7 @@ function runVerification(artifactPath, scope, verification, sessionDir, agentTyp
  *   2. Else → use artifact's Result: line (PASS/FAIL/REVISE/CONVERGED)
  *   3. No match → "UNKNOWN", allow (fail-open)
  *
- * mdContent (last param) is optional — legacy compat path omits it.
+ * mdContent is required for gate transitions.
  */
 function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent, agentType, agentId, sessionId, scope, sessionDir, mdContent, db) {
   const resolvedSessionDir = sessionDir || (sessionId ? path.join(HOME, ".claude", "sessions", sessionId) : null);
@@ -275,7 +268,8 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
   combinedPrompt += `--- ${path.basename(artifactPath)} ---\n${artifactContent}\n`;
   if (contextContent) combinedPrompt += contextContent;
 
-  let result;
+  let result = "";
+  let semanticSkipped = false;
   try {
     // Pipe prompt via stdin — eliminates shell injection and temp files
     result = execSync(
@@ -290,13 +284,15 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
       }
     ).trim();
   } catch {
-    return; // fail-open
+    // Semantic check failed — skip semantic layer but continue with
+    // verdict recording and gate transitions (fail-open on semantic only)
+    semanticSkipped = true;
   }
 
   // Parse last line for PASS/FAIL from semantic checker
   const lines = result.split("\n").filter(l => l.trim());
   const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : "";
-  const semanticMatch = /^(PASS|FAIL)(?:[:\s\u2014\u2013-]+(.*))?$/i.exec(lastLine);
+  const semanticMatch = semanticSkipped ? null : /^(PASS|FAIL)(?:[:\s\u2014\u2013-]+(.*))?$/i.exec(lastLine);
 
   // Write audit trail
   const auditDir = scope && resolvedSessionDir ? path.join(resolvedSessionDir, scope) : resolvedSessionDir;
@@ -337,15 +333,11 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
     }
   }
 
-  // Record verdict to session_scopes.json
-  const onRevise = parseOnRevise(mdContent);
-  const maxRounds = parseMaxRounds(mdContent);
-  const verdictObj = recordVerdict(resolvedSessionDir, scope, agentType, finalVerdict, onRevise, maxRounds, db);
+  // Record verdict
+  const verdictObj = recordVerdict(resolvedSessionDir, scope, agentType, finalVerdict, db);
 
   if (verdictObj) {
-    const maxStr = verdictObj.max ? `/${verdictObj.max}` : "";
-    const reviseStr = verdictObj.on_revise ? ` Designated remediation: ${verdictObj.on_revise}.` : "";
-    process.stderr.write(`[ClaudeGates] Verdict: ${finalVerdict} (round ${verdictObj.round}${maxStr}).${reviseStr}\n`);
+    process.stderr.write(`[ClaudeGates] Verdict: ${finalVerdict} (round ${verdictObj.round}).\n`);
   }
 
   // Only FAIL blocks; REVISE/CONVERGED/PASS/UNKNOWN allow
@@ -358,6 +350,97 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
   // PASS/REVISE/CONVERGED/UNKNOWN → allow (orchestrator reads session_scopes.json for retry decisions)
   if (!verdictObj) {
     process.stderr.write(`[ClaudeGates] ${agentType}: ${lastLine}\n`);
+  }
+
+  // ── Gate state machine transitions ──
+  processGateTransitions(db, scope, agentType, finalVerdict, mdContent);
+}
+
+/**
+ * Gates-only check: structural verification + gate transitions (no semantic layer).
+ * Used when agent has gates: but no verification: field.
+ */
+function runGatesOnlyCheck(artifactInfo, sessionDir, agentType, mdContent, db) {
+  const { artifactPath, scope } = artifactInfo;
+
+  if (!fs.existsSync(artifactPath)) {
+    block(`Artifact not found at ${artifactPath.replace(/\\/g, "/")}. Write it before stopping.`);
+    return;
+  }
+
+  const artifactContent = fs.readFileSync(artifactPath, "utf-8");
+
+  // Layer 1 only: Result: line must exist
+  if (!VERDICT_RE.test(artifactContent)) {
+    block(`Your ${agentType}.md is missing a Result: line. Add 'Result: PASS' or 'Result: FAIL' as a standalone line.`);
+    return;
+  }
+
+  // Use artifact's Result: line as authoritative verdict (no semantic check)
+  const artifactVerdictMatch = VERDICT_RE.exec(artifactContent);
+  const finalVerdict = artifactVerdictMatch ? artifactVerdictMatch[1].toUpperCase() : "UNKNOWN";
+
+  // Record verdict
+  recordVerdict(sessionDir, scope, agentType, finalVerdict, db);
+
+  process.stderr.write(`[ClaudeGates] ${agentType}: ${finalVerdict} (gates-only, no semantic check)\n`);
+
+  // Gate state machine transitions
+  processGateTransitions(db, scope, agentType, finalVerdict, mdContent);
+}
+
+/**
+ * Process gate state machine transitions after an agent completes.
+ *
+ * Two cases:
+ *   1. Source agent completed → initialize gates (first time) or reactivate revise gate
+ *   2. Gate agent completed → advance chain (PASS) or request revision (REVISE)
+ */
+function processGateTransitions(db, scope, agentType, finalVerdict, mdContent) {
+  if (!db || !scope) return;
+
+  const gates = gatesDb.getGates(db, scope);
+
+  if (gates.length > 0) {
+    // Case 1: This agent IS an active gate agent
+    const activeGate = gates.find(g => g.gate_agent === agentType && g.status === "active");
+    if (activeGate) {
+      if (finalVerdict === "PASS" || finalVerdict === "CONVERGED") {
+        const { nextGate, allPassed } = gatesDb.passGate(db, scope, activeGate.seq);
+        if (allPassed) {
+          process.stderr.write(`[ClaudeGates] All gates passed for scope "${scope}". Scope fully unblocked.\n`);
+        } else if (nextGate) {
+          process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} passed. Next gate: ${nextGate.gate_agent} (spawn with scope=${scope}).\n`);
+        }
+      } else if (finalVerdict === "REVISE") {
+        const result = gatesDb.reviseGate(db, scope, activeGate.seq);
+        if (result && result.status === "failed") {
+          process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} exhausted max rounds (${activeGate.max_rounds}). Scope "${scope}" gate chain FAILED.\n`);
+        } else if (result) {
+          process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} returned REVISE (round ${result.round}/${activeGate.max_rounds}). Resume source agent "${activeGate.source_agent}" with scope=${scope}.\n`);
+        }
+      }
+      return; // gate agent handled, don't check source path
+    }
+
+    // Case 2: This agent is the SOURCE agent for gates in revise status
+    const sourceAgent = gates[0].source_agent;
+    if (sourceAgent === agentType) {
+      const reactivated = gatesDb.reactivateReviseGate(db, scope);
+      if (reactivated) {
+        process.stderr.write(`[ClaudeGates] Source agent "${agentType}" re-completed. Gate reactivated for re-run.\n`);
+      }
+    }
+  } else {
+    // No gates in DB yet — check if this agent defines gates (first completion)
+    const agentGates = parseGates(mdContent);
+    if (agentGates && (finalVerdict === "PASS" || finalVerdict === "CONVERGED")) {
+      gatesDb.initGates(db, scope, agentType, agentGates);
+      process.stderr.write(
+        `[ClaudeGates] Initialized ${agentGates.length} gate(s) for scope "${scope}": ${agentGates.map(g => g.agent).join(" -> ")}. ` +
+        `Next: spawn ${agentGates[0].agent} with scope=${scope}.\n`
+      );
+    }
   }
 }
 

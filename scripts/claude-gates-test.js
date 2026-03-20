@@ -2,7 +2,7 @@
 /**
  * ClaudeGates v2 — test suite.
  *
- * Tests shared parsers, compat module, plugin wiring, and hook integration.
+ * Tests shared parsers, plugin wiring, and hook integration.
  * Run: node scripts/claude-gates-test.js
  */
 
@@ -12,7 +12,6 @@ const os = require("os");
 const { execSync } = require("child_process");
 
 const shared = require("./claude-gates-shared.js");
-const compat = require("./claude-gates-compat.js");
 const gatesDb = require("./claude-gates-db.js");
 
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -108,6 +107,46 @@ assert(
   "no frontmatter returns null"
 );
 
+// ── parseGates ──────────────────────────────────────────────────────
+
+describe("parseGates");
+
+const gatesBasic = shared.parseGates('---\ngates:\n  - [reviewer, 3]\n  - [playtester, 2]\n---\n');
+assert(gatesBasic && gatesBasic.length === 2, "block sequence with two entries");
+assert(gatesBasic && gatesBasic[0].agent === "reviewer" && gatesBasic[0].maxRounds === 3, "first entry parsed correctly");
+assert(gatesBasic && gatesBasic[1].agent === "playtester" && gatesBasic[1].maxRounds === 2, "second entry parsed correctly");
+
+const gatesSingle = shared.parseGates('---\ngates:\n  - [reviewer, 5]\n---\n');
+assert(gatesSingle && gatesSingle.length === 1, "single entry");
+assert(gatesSingle && gatesSingle[0].maxRounds === 5, "maxRounds parsed");
+
+const gatesQuoted = shared.parseGates('---\ngates:\n  - ["reviewer", 3]\n---\n');
+assert(gatesQuoted && gatesQuoted[0].agent === "reviewer", "quoted agent name");
+
+assert(shared.parseGates('---\nname: foo\n---\n') === null, "missing gates returns null");
+assert(shared.parseGates('---\ngates:\n---\n') === null, "empty gates block returns null");
+assert(shared.parseGates("no frontmatter") === null, "no frontmatter returns null");
+
+// ── parseConditions ─────────────────────────────────────────────────
+
+describe("parseConditions");
+
+const condBasic = shared.parseConditions('---\nconditions: |\n  Check the spec.\n  Reply PASS or FAIL.\n---\n');
+assert(condBasic && condBasic.startsWith("Check"), "basic conditions parsed");
+assert(shared.parseConditions('---\nname: foo\n---\n') === null, "missing conditions returns null");
+assert(shared.parseConditions("no frontmatter") === null, "no frontmatter returns null");
+
+// ── requiresScope ───────────────────────────────────────────────────
+
+describe("requiresScope");
+
+assert(shared.requiresScope('---\nrequires: ["a"]\n---\n') === true, "requires: needs scope");
+assert(shared.requiresScope('---\ngates:\n  - [r, 3]\n---\n') === true, "gates: needs scope");
+assert(shared.requiresScope('---\nconditions: |\n  check\n---\n') === true, "conditions: needs scope");
+assert(shared.requiresScope('---\nverification: |\n  test\n---\n') === false, "verification: alone does NOT need scope");
+assert(shared.requiresScope('---\nname: foo\n---\n') === false, "no CG fields does not need scope");
+assert(shared.requiresScope("no frontmatter") === false, "no frontmatter does not need scope");
+
 // ── parseVerification (new schema) ──────────────────────────────────
 
 describe("parseVerification — new schema");
@@ -126,21 +165,6 @@ const crlfVerification = shared.parseVerification(
   '---\r\nverification: |\r\n  CRLF prompt.\r\n  Second line.\r\n---\r\n'
 );
 assert(crlfVerification && crlfVerification.startsWith("CRLF"), "CRLF in verification block scalar");
-
-// ── parseVerification (old gate: fallback) ──────────────────────────
-
-describe("parseVerification — old gate: fallback");
-
-const oldSchemaV = shared.parseVerification(
-  '---\ngate:\n  artifact: "x"\n  prompt: |\n    Old prompt here.\n    Second line.\n---\n'
-);
-assert(oldSchemaV && oldSchemaV.startsWith("Old prompt"), "old gate.prompt fallback");
-
-// New schema takes precedence over old
-const bothSchemas = shared.parseVerification(
-  '---\nverification: |\n  New prompt.\ngate:\n  prompt: |\n    Old prompt.\n---\n'
-);
-assert(bothSchemas && bothSchemas.startsWith("New"), "new schema takes precedence");
 
 // ── findAgentMd ─────────────────────────────────────────────────────
 
@@ -174,50 +198,6 @@ assert(shared.VERDICT_RE.test("Result: REVISE"), "matches REVISE");
 assert(shared.VERDICT_RE.test("Result: CONVERGED"), "matches CONVERGED");
 assert(!shared.VERDICT_RE.test("no result here"), "rejects non-match");
 assert(shared.VERDICT_RE.test("line1\nResult: PASS\nline3"), "matches in multiline");
-
-// ── compat: parseLegacyGate ─────────────────────────────────────────
-
-describe("compat: parseLegacyGate");
-
-const legacyMd = `---
-name: reviewer
-gate:
-  artifact: "{task_dir}/review.md"
-  required: true
-  verdict: true
-  prompt: |
-    Below is a review.md.
-    Reply PASS or FAIL.
-  context:
-    - "{task_dir}/spec.md"
----
-body`;
-
-const gate = compat.parseLegacyGate(legacyMd);
-assert(gate !== null, "parses legacy gate");
-assert(gate.artifact === "{task_dir}/review.md", "artifact field");
-assert(gate.required === true, "required field");
-assert(gate.verdict === true, "verdict field");
-assert(gate.context && gate.context[0] === "{task_dir}/spec.md", "context field");
-
-assert(compat.parseLegacyGate("---\nname: foo\n---\n") === null, "no gate returns null");
-
-// ── compat: resolveTaskDir ──────────────────────────────────────────
-
-describe("compat: resolveTaskDir");
-
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentgate-test-"));
-const tasksDir = path.join(tmpDir, ".context", "tasks");
-fs.mkdirSync(path.join(tasksDir, "1"), { recursive: true });
-fs.mkdirSync(path.join(tasksDir, "2"), { recursive: true });
-fs.mkdirSync(path.join(tasksDir, "10"), { recursive: true });
-
-const resolved = compat.resolveTaskDir(tmpDir);
-assert(resolved === ".context/tasks/10", "resolves highest-numbered task dir");
-
-assert(compat.resolveTaskDir("/nonexistent/path") === null, "nonexistent returns null");
-
-fs.rmSync(tmpDir, { recursive: true, force: true });
 
 // ── Plugin wiring: hooks.json ───────────────────────────────────────
 
@@ -276,7 +256,6 @@ const skill = fs.readFileSync(skillPath, "utf-8");
 assert(skill.includes("user-invocable: false"), "user-invocable: false set");
 assert(skill.includes("scope="), "mentions scope=");
 assert(skill.includes("Hybrid enforcement"), "mentions hybrid enforcement");
-assert(skill.includes("claude-gates-compat"), "mentions compat module");
 assert(skill.includes("<agent_gate"), "mentions <agent_gate> tag");
 
 // ── Hook integration: conditions ────────────────────────────────────
@@ -334,13 +313,22 @@ const resumeResult = runConditions({
 assert(resumeResult.exitCode === 0, "resume allows (exit 0)");
 assert(!resumeResult.stdout.includes("block"), "resume produces no block");
 
-// No scope → should allow
+// No scope + CG fields → should block (scope required)
 const noScopeResult = runConditions({
   session_id: "test-session",
   tool_input: { subagent_type: "reviewer", prompt: "just review stuff" }
 }, { USERPROFILE: tmpSession, HOME: tmpSession });
-assert(noScopeResult.exitCode === 0, "no scope allows (exit 0)");
-assert(!noScopeResult.stdout.includes("block"), "no scope produces no block");
+assert(noScopeResult.exitCode === 0, "no scope + CG fields exits 0");
+assert(noScopeResult.stdout.includes("block"), "no scope + CG fields blocks (scope required)");
+
+// No scope + no CG fields → should allow
+fs.writeFileSync(path.join(tmpAgents, "helper.md"), '---\nname: helper\n---\n');
+const noScopeNoCgResult = runConditions({
+  session_id: "test-session",
+  tool_input: { subagent_type: "helper", prompt: "just help" }
+}, { USERPROFILE: tmpSession, HOME: tmpSession });
+assert(noScopeNoCgResult.exitCode === 0, "no scope + no CG fields allows (exit 0)");
+assert(!noScopeNoCgResult.stdout.includes("block"), "no scope + no CG fields produces no block");
 
 // Deps satisfied → should allow + stage _pending
 const scopeDir = path.join(tmpSession, ".claude", "sessions", "test-session", "task-2");
@@ -448,57 +436,9 @@ if (ungatedResult.stdout.trim()) {
 // Cleanup
 fs.rmSync(tmpSession, { recursive: true, force: true });
 
-// ── parseOnRevise ────────────────────────────────────────────────────
+// ── Verdict object structure ─────────────────────────────────────────
 
-describe("parseOnRevise");
-
-assert(
-  shared.parseOnRevise('---\non_revise: fixer\n---\n') === "fixer",
-  "bare value"
-);
-
-assert(
-  shared.parseOnRevise('---\non_revise: "fixer"\n---\n') === "fixer",
-  "double-quoted value"
-);
-
-assert(
-  shared.parseOnRevise("---\non_revise: 'fixer'\n---\n") === "fixer",
-  "single-quoted value"
-);
-
-assert(
-  shared.parseOnRevise('---\nname: foo\n---\n') === null,
-  "missing on_revise returns null"
-);
-
-// ── parseMaxRounds ───────────────────────────────────────────────────
-
-describe("parseMaxRounds");
-
-assert(
-  shared.parseMaxRounds('---\nmax_rounds: 3\n---\n') === 3,
-  "valid integer"
-);
-
-assert(
-  shared.parseMaxRounds('---\nmax_rounds: 0\n---\n') === 0,
-  "zero is valid"
-);
-
-assert(
-  shared.parseMaxRounds('---\nmax_rounds: 10\n---\n') === 10,
-  "double-digit value"
-);
-
-assert(
-  shared.parseMaxRounds('---\nname: foo\n---\n') === null,
-  "missing max_rounds returns null"
-);
-
-// ── Verdict object backward compat ───────────────────────────────────
-
-describe("verdict object backward compat");
+describe("verdict object structure");
 
 // truthiness: both true and verdict objects are truthy
 assert(!!true, "boolean true is truthy");
@@ -509,7 +449,7 @@ const fromBool = { verdict: "PASS", round: 1 };
 assert(fromBool.round === 1, "first round from boolean starts at 1");
 
 // round increment from existing object
-const existingObj = { verdict: "REVISE", round: 2, max: 3, on_revise: "fixer" };
+const existingObj = { verdict: "REVISE", round: 2 };
 const nextRound = existingObj.round + 1;
 assert(nextRound === 3, "round increments from existing object");
 
@@ -535,7 +475,7 @@ const reSpawnScopesFile = path.join(reSpawnSessionDir, "session_scopes.json");
 const reSpawnScopeDir = path.join(reSpawnSessionDir, "task-x");
 fs.mkdirSync(reSpawnScopeDir, { recursive: true });
 fs.writeFileSync(reSpawnScopesFile, JSON.stringify({
-  "task-x": { cleared: { worker: { verdict: "REVISE", round: 1, max: 3 } } }
+  "task-x": { cleared: { worker: { verdict: "REVISE", round: 1 } } }
 }, null, 2), "utf-8");
 
 // Run conditions for the same agent — should preserve existing verdict object
@@ -679,18 +619,42 @@ const dirtyFile = path.join(tmpStopSession, "dirty.js");
 fs.writeFileSync(dirtyFile, "// TODO: remove this\nconsole.log('debug');\n", "utf-8");
 fs.writeFileSync(path.join(stopSessionDir, "edits.log"), dirtyFile.replace(/\\/g, "/") + "\n", "utf-8");
 
-// Test: dirty files → block
-const dirtyResult = runStopGate({ session_id: "stop-test" }, { USERPROFILE: tmpStopSession, HOME: tmpStopSession });
+// Test: dirty files in default warn mode → no block (stderr only)
+const dirtyWarnResult = runStopGate({ session_id: "stop-test" }, { USERPROFILE: tmpStopSession, HOME: tmpStopSession });
+assert(!dirtyWarnResult.stdout.includes("block"), "warn mode: dirty files produce no block");
+
+// Test: dirty files in nudge mode → block
+const nudgeConfig = path.join(os.tmpdir(), "cg-nudge-config.json");
+fs.writeFileSync(nudgeConfig, JSON.stringify({ stop_gate: { mode: "nudge" } }), "utf-8");
+
+// Need fresh session for nudge test (no marker from prior runs)
+const tmpNudgeSession = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stop-nudge-"));
+const nudgeSessionDir = path.join(tmpNudgeSession, ".claude", "sessions", "stop-nudge");
+fs.mkdirSync(nudgeSessionDir, { recursive: true });
+const nudgeDirty = path.join(tmpNudgeSession, "dirty.js");
+fs.writeFileSync(nudgeDirty, "// TODO: fix\n", "utf-8");
+fs.writeFileSync(path.join(nudgeSessionDir, "edits.log"), nudgeDirty.replace(/\\/g, "/") + "\n", "utf-8");
+
+const dirtyResult = runStopGate(
+  { session_id: "stop-nudge" },
+  { USERPROFILE: tmpNudgeSession, HOME: tmpNudgeSession, CLAUDE_GATES_CONFIG: nudgeConfig }
+);
 if (dirtyResult.stdout.trim()) {
   const dirtyOutput = JSON.parse(dirtyResult.stdout);
-  assert(dirtyOutput.decision === "block", "dirty files block stop-gate");
+  assert(dirtyOutput.decision === "block", "nudge mode: dirty files block stop-gate");
 } else {
-  assert(false, "dirty files block stop-gate (no output)");
+  assert(false, "nudge mode: dirty files block stop-gate (no output)");
 }
 
-// Test: second stop passes (marker exists)
-const secondResult = runStopGate({ session_id: "stop-test" }, { USERPROFILE: tmpStopSession, HOME: tmpStopSession });
-assert(secondResult.exitCode === 0 && !secondResult.stdout.includes("block"), "second stop passes (marker)");
+// Test: second stop in nudge mode passes (marker exists)
+const secondResult = runStopGate(
+  { session_id: "stop-nudge" },
+  { USERPROFILE: tmpNudgeSession, HOME: tmpNudgeSession, CLAUDE_GATES_CONFIG: nudgeConfig }
+);
+assert(secondResult.exitCode === 0 && !secondResult.stdout.includes("block"), "nudge mode: second stop passes (marker)");
+
+fs.rmSync(tmpNudgeSession, { recursive: true, force: true });
+try { fs.unlinkSync(nudgeConfig); } catch {}
 
 // Test: deleted files are skipped
 const deletedStopSession = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stop2-"));
@@ -847,9 +811,9 @@ if (db) {
   const r1 = gatesDb.getCleared(db, "test-scope", "auditor");
   assert(r1 && r1.round === 1, "round 1 stored");
 
-  gatesDb.setCleared(db, "test-scope", "auditor", { verdict: "REVISE", round: 2, max: 5, on_revise: "fixer" });
+  gatesDb.setCleared(db, "test-scope", "auditor", { verdict: "REVISE", round: 2 });
   const r2 = gatesDb.getCleared(db, "test-scope", "auditor");
-  assert(r2 && r2.round === 2 && r2.max === 5 && r2.on_revise === "fixer", "round 2 with max and on_revise");
+  assert(r2 && r2.round === 2 && r2.verdict === "REVISE", "round 2 with verdict");
 
   // ── Pending roundtrip ──
   describe("SQLite DB: pending roundtrip");
@@ -931,7 +895,7 @@ if (db) {
     "scope-a": {
       cleared: {
         implementer: true,
-        reviewer: { verdict: "PASS", round: 2, max: 3, on_revise: "fixer" }
+        reviewer: { verdict: "PASS", round: 2 }
       }
     },
     "_pending": {
@@ -1078,9 +1042,9 @@ describe("SQLite DB: fallback — JSON path works without DB");
 // The existing tests all pass → JSON path works.
 assert(true, "JSON fallback verified by existing integration tests");
 
-// ── hooks.json wiring: plan-gate and adversary-stamp ──────────────────
+// ── hooks.json wiring: plan-gate, commit-gate, SubagentStop ──────────
 
-describe("hooks.json wiring: plan-gate and adversary-stamp");
+describe("hooks.json wiring: plan-gate, commit-gate, SubagentStop");
 
 // Re-read hooks.json to pick up new entries
 const hooksJsonNew = JSON.parse(
@@ -1094,22 +1058,23 @@ assert(
   planHook && planHook.hooks[0].command.includes("plan-gate"),
   "plan-gate hook wired"
 );
+
+const bashHookNew = preToolUseNew.find(h => h.matcher === "Bash");
 assert(
-  planHook && planHook.hooks[0].command.includes("${CLAUDE_PLUGIN_ROOT}"),
-  "plan-gate uses ${CLAUDE_PLUGIN_ROOT}"
+  bashHookNew && bashHookNew.hooks.some(h => h.command.includes("commit-gate")),
+  "PreToolUse:Bash has commit-gate wired"
 );
 
 const subStopNew = hooksJsonNew.hooks.SubagentStop || [];
-const stampHook = subStopNew.find(e => e.hooks.some(h => h.command.includes("adversary-stamp")));
-assert(!!stampHook, "SubagentStop adversary-stamp hook registered");
+assert(subStopNew.length === 1, "SubagentStop has exactly 1 entry (verification only, no gater-stamp)");
 assert(
-  !stampHook.matcher,
-  "adversary-stamp has no matcher (SubagentStop doesn't support matchers)"
+  subStopNew[0].hooks[0].command.includes("claude-gates-verification"),
+  "SubagentStop runs verification.js"
 );
 
-// ── plan-gate integration ─────────────────────────────────────────────
+// ── plan-gate integration (verdict-based) ─────────────────────────────
 
-describe("plan-gate integration");
+describe("plan-gate integration (verdict-based)");
 
 const planGateScript = path.join(__dirname, "plan-gate.js");
 
@@ -1136,17 +1101,17 @@ fs.mkdirSync(planDir, { recursive: true });
 const bigPlan = Array.from({ length: 30 }, (_, i) => `Line ${i + 1}`).join("\n");
 fs.writeFileSync(path.join(planDir, "test-plan.md"), bigPlan, "utf-8");
 
-// Test: no marker + non-trivial plan → block
+// Test: no gater verdict + non-trivial plan → block
 const planBlock = runPlanGate(
   { session_id: "plan-test" },
   { USERPROFILE: tmpPlanHome, HOME: tmpPlanHome }
 );
 if (planBlock.stdout.trim()) {
   const planOutput = JSON.parse(planBlock.stdout);
-  assert(planOutput.decision === "block", "plan-gate blocks without marker");
+  assert(planOutput.decision === "block", "plan-gate blocks without gater verdict");
   assert(planOutput.reason.includes("test-plan.md"), "block reason mentions plan file");
 } else {
-  assert(false, "plan-gate blocks without marker (no output)");
+  assert(false, "plan-gate blocks without gater verdict (no output)");
   assert(false, "block reason mentions plan file (no output)");
 }
 
@@ -1173,72 +1138,131 @@ const noPlanResult = runPlanGate(
 assert(noPlanResult.exitCode === 0 && !noPlanResult.stdout.includes("block"), "no plans dir allows (fail-open)");
 fs.rmSync(noPlanHome, { recursive: true, force: true });
 
-// Test: marker present → allow + marker consumed
-const planSessionDir = path.join(tmpPlanHome, ".claude", "sessions", "plan-marker-test");
-fs.mkdirSync(planSessionDir, { recursive: true });
-// Set marker via DB if available, else via file
-const planMarkerDb = gatesDb.getDb(planSessionDir);
-if (planMarkerDb) {
-  gatesDb.setMarker(planMarkerDb, "plan_verified", '{"result":"PASS"}');
-  planMarkerDb.close();
+// Test: gater verdict PASS in session_scopes → allow
+const planVerdictHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-plan-verdict-"));
+const planVerdictPlans = path.join(planVerdictHome, ".claude", "plans");
+fs.mkdirSync(planVerdictPlans, { recursive: true });
+fs.writeFileSync(path.join(planVerdictPlans, "big.md"), bigPlan, "utf-8");
+const planVerdictSession = path.join(planVerdictHome, ".claude", "sessions", "plan-verdict-test");
+fs.mkdirSync(planVerdictSession, { recursive: true });
+
+// Seed gater verdict via DB or JSON
+const pvDb = gatesDb.getDb(planVerdictSession);
+if (pvDb) {
+  gatesDb.ensureScope(pvDb, "verify-plan");
+  gatesDb.setCleared(pvDb, "verify-plan", "gater", { verdict: "PASS", round: 1 });
+  pvDb.close();
 } else {
-  fs.writeFileSync(path.join(planSessionDir, "plan_verified"), '{"result":"PASS"}', "utf-8");
+  fs.writeFileSync(path.join(planVerdictSession, "session_scopes.json"), JSON.stringify({
+    "verify-plan": { cleared: { gater: { verdict: "PASS", round: 1 } } }
+  }, null, 2), "utf-8");
 }
 
-const markerResult = runPlanGate(
-  { session_id: "plan-marker-test" },
-  { USERPROFILE: tmpPlanHome, HOME: tmpPlanHome }
+const verdictResult = runPlanGate(
+  { session_id: "plan-verdict-test" },
+  { USERPROFILE: planVerdictHome, HOME: planVerdictHome }
 );
-assert(markerResult.exitCode === 0 && !markerResult.stdout.includes("block"), "marker present allows");
+assert(verdictResult.exitCode === 0 && !verdictResult.stdout.includes("block"), "gater PASS verdict allows");
 
-// Check marker was consumed
-const planMarkerDb2 = gatesDb.getDb(planSessionDir);
-if (planMarkerDb2) {
-  assert(!gatesDb.hasMarker(planMarkerDb2, "plan_verified"), "marker consumed after use");
-  planMarkerDb2.close();
+// Test: gater verdict CONVERGED → also allows
+const planConvSession = path.join(planVerdictHome, ".claude", "sessions", "plan-conv-test");
+fs.mkdirSync(planConvSession, { recursive: true });
+const pcDb = gatesDb.getDb(planConvSession);
+if (pcDb) {
+  gatesDb.ensureScope(pcDb, "verify-plan");
+  gatesDb.setCleared(pcDb, "verify-plan", "gater", { verdict: "CONVERGED", round: 1 });
+  pcDb.close();
 } else {
-  assert(!fs.existsSync(path.join(planSessionDir, "plan_verified")), "marker consumed after use");
+  fs.writeFileSync(path.join(planConvSession, "session_scopes.json"), JSON.stringify({
+    "verify-plan": { cleared: { gater: { verdict: "CONVERGED", round: 1 } } }
+  }, null, 2), "utf-8");
 }
 
-// Test: legacy plan_challenged marker works
-const legacySessionDir = path.join(tmpPlanHome, ".claude", "sessions", "plan-legacy-test");
-fs.mkdirSync(legacySessionDir, { recursive: true });
-const legacyDb = gatesDb.getDb(legacySessionDir);
-if (legacyDb) {
-  gatesDb.setMarker(legacyDb, "plan_challenged", "1");
-  legacyDb.close();
-} else {
-  fs.writeFileSync(path.join(legacySessionDir, "plan_challenged"), "1", "utf-8");
-}
-
-const legacyResult = runPlanGate(
-  { session_id: "plan-legacy-test" },
-  { USERPROFILE: tmpPlanHome, HOME: tmpPlanHome }
+const convResult = runPlanGate(
+  { session_id: "plan-conv-test" },
+  { USERPROFILE: planVerdictHome, HOME: planVerdictHome }
 );
-assert(legacyResult.exitCode === 0 && !legacyResult.stdout.includes("block"), "legacy plan_challenged marker allows");
+assert(convResult.exitCode === 0 && !convResult.stdout.includes("block"), "gater CONVERGED verdict allows");
 
-const legacyDb2 = gatesDb.getDb(legacySessionDir);
-if (legacyDb2) {
-  assert(!gatesDb.hasMarker(legacyDb2, "plan_challenged"), "legacy marker consumed");
-  legacyDb2.close();
+// Test: gater FAIL verdict → blocks (not sufficient)
+const planFailSession = path.join(planVerdictHome, ".claude", "sessions", "plan-fail-test");
+fs.mkdirSync(planFailSession, { recursive: true });
+const pfDb = gatesDb.getDb(planFailSession);
+if (pfDb) {
+  gatesDb.ensureScope(pfDb, "verify-plan");
+  gatesDb.setCleared(pfDb, "verify-plan", "gater", { verdict: "FAIL", round: 1 });
+  pfDb.close();
 } else {
-  assert(!fs.existsSync(path.join(legacySessionDir, "plan_challenged")), "legacy marker consumed");
+  fs.writeFileSync(path.join(planFailSession, "session_scopes.json"), JSON.stringify({
+    "verify-plan": { cleared: { gater: { verdict: "FAIL", round: 1 } } }
+  }, null, 2), "utf-8");
 }
 
+const failResult = runPlanGate(
+  { session_id: "plan-fail-test" },
+  { USERPROFILE: planVerdictHome, HOME: planVerdictHome }
+);
+assert(failResult.stdout.includes("block"), "gater FAIL verdict still blocks");
+
+fs.rmSync(planVerdictHome, { recursive: true, force: true });
 fs.rmSync(tmpPlanHome, { recursive: true, force: true });
 
-// ── adversary-stamp integration ──────────────────────────────────────
+// ── config module ────────────────────────────────────────────────────
 
-describe("adversary-stamp integration");
+describe("config module");
 
-const adversaryStampScript = path.join(__dirname, "adversary-stamp.js");
+const configMod = require("./claude-gates-config.js");
 
-function runAdversaryStamp(payload, env) {
+// Test: no config file → defaults
+configMod._resetCache();
+const defaultConfig = configMod.loadConfig();
+assert(defaultConfig.stop_gate.mode === "warn", "default stop_gate mode is warn");
+assert(defaultConfig.commit_gate.enabled === false, "default commit_gate is disabled");
+assert(defaultConfig.edit_gate.file_threshold === 10, "default file_threshold is 10");
+assert(defaultConfig.edit_gate.line_threshold === 200, "default line_threshold is 200");
+
+// Test: env var override
+const tmpConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-config-"));
+const tmpConfigFile = path.join(tmpConfigDir, "test-config.json");
+fs.writeFileSync(tmpConfigFile, JSON.stringify({
+  stop_gate: { mode: "nudge" },
+  edit_gate: { file_threshold: 5 }
+}), "utf-8");
+
+configMod._resetCache();
+process.env.CLAUDE_GATES_CONFIG = tmpConfigFile;
+const envConfig = configMod.loadConfig();
+assert(envConfig.stop_gate.mode === "nudge", "env var config: mode overridden to nudge");
+assert(envConfig.stop_gate.patterns.length === 4, "env var config: patterns kept from defaults");
+assert(envConfig.edit_gate.file_threshold === 5, "env var config: file_threshold overridden");
+assert(envConfig.edit_gate.line_threshold === 200, "env var config: line_threshold from defaults");
+delete process.env.CLAUDE_GATES_CONFIG;
+configMod._resetCache();
+
+// Test: malformed config → defaults
+const malformedFile = path.join(tmpConfigDir, "bad.json");
+fs.writeFileSync(malformedFile, "not json{{{", "utf-8");
+configMod._resetCache();
+process.env.CLAUDE_GATES_CONFIG = malformedFile;
+const malformedConfig = configMod.loadConfig();
+assert(malformedConfig.stop_gate.mode === "warn", "malformed config falls back to defaults");
+delete process.env.CLAUDE_GATES_CONFIG;
+configMod._resetCache();
+
+fs.rmSync(tmpConfigDir, { recursive: true, force: true });
+
+// ── commit-gate integration ──────────────────────────────────────────
+
+describe("commit-gate integration");
+
+const commitGateScript = path.join(__dirname, "commit-gate.js");
+
+function runCommitGate(payload, env) {
   try {
-    const result = execSync(`node "${adversaryStampScript}"`, {
+    const result = execSync(`node "${commitGateScript}"`, {
       input: JSON.stringify(payload),
       encoding: "utf-8",
-      timeout: 5000,
+      timeout: 10000,
       env: { ...process.env, ...env }
     });
     return { stdout: result, exitCode: 0 };
@@ -1247,151 +1271,48 @@ function runAdversaryStamp(payload, env) {
   }
 }
 
-const tmpStampHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stamp-"));
+// Test: disabled → no block
+const commitDisabledConfig = path.join(os.tmpdir(), "cg-commit-disabled.json");
+fs.writeFileSync(commitDisabledConfig, JSON.stringify({ commit_gate: { enabled: false } }), "utf-8");
+const commitDisabled = runCommitGate(
+  { tool_input: { command: "git commit -m 'test'" } },
+  { CLAUDE_GATES_CONFIG: commitDisabledConfig }
+);
+assert(!commitDisabled.stdout.includes("block"), "commit-gate disabled: no block");
 
-// Test: PASS → stamps plan_verified
-const stampPassSession = path.join(tmpStampHome, ".claude", "sessions", "stamp-pass");
-fs.mkdirSync(stampPassSession, { recursive: true });
+// Test: non-commit command → no block
+const commitEnabledConfig = path.join(os.tmpdir(), "cg-commit-enabled.json");
+fs.writeFileSync(commitEnabledConfig, JSON.stringify({
+  commit_gate: { enabled: true, commands: ["node -e process.exit(1)"] }
+}), "utf-8");
+const nonCommit = runCommitGate(
+  { tool_input: { command: "git status" } },
+  { CLAUDE_GATES_CONFIG: commitEnabledConfig }
+);
+assert(!nonCommit.stdout.includes("block"), "commit-gate: non-commit command passes");
 
-runAdversaryStamp({
-  session_id: "stamp-pass",
-  agent_type: "adversary",
-  last_assistant_message: "Analysis complete.\nResult: PASS"
-}, { USERPROFILE: tmpStampHome, HOME: tmpStampHome });
+// Test: git commit + failing command → block
+const commitFail = runCommitGate(
+  { tool_input: { command: "git commit -m 'test'" } },
+  { CLAUDE_GATES_CONFIG: commitEnabledConfig }
+);
+assert(commitFail.stdout.includes("block"), "commit-gate: failing command blocks commit");
 
-// Check stamp (DB or file)
-const stampDbFile = path.join(stampPassSession, "session.db");
-const stampJsonFile = path.join(stampPassSession, "plan_verified");
-if (fs.existsSync(stampDbFile)) {
-  const sdb = gatesDb.getDb(stampPassSession);
-  assert(gatesDb.hasMarker(sdb, "plan_verified"), "PASS stamps plan_verified (DB)");
-  sdb.close();
-} else {
-  assert(fs.existsSync(stampJsonFile), "PASS stamps plan_verified (JSON)");
-}
+// Test: git commit + passing command → no block
+const commitPassConfig = path.join(os.tmpdir(), "cg-commit-pass.json");
+fs.writeFileSync(commitPassConfig, JSON.stringify({
+  commit_gate: { enabled: true, commands: ["node -e process.exit(0)"] }
+}), "utf-8");
+const commitPass = runCommitGate(
+  { tool_input: { command: "git commit -m 'test'" } },
+  { CLAUDE_GATES_CONFIG: commitPassConfig }
+);
+assert(!commitPass.stdout.includes("block"), "commit-gate: passing command allows commit");
 
-// Test: CONVERGED → stamps
-const stampConvSession = path.join(tmpStampHome, ".claude", "sessions", "stamp-conv");
-fs.mkdirSync(stampConvSession, { recursive: true });
-
-runAdversaryStamp({
-  session_id: "stamp-conv",
-  agent_type: "adversary",
-  last_assistant_message: "Result: CONVERGED"
-}, { USERPROFILE: tmpStampHome, HOME: tmpStampHome });
-
-const convDbFile = path.join(stampConvSession, "session.db");
-const convJsonFile = path.join(stampConvSession, "plan_verified");
-if (fs.existsSync(convDbFile)) {
-  const cdb = gatesDb.getDb(stampConvSession);
-  assert(gatesDb.hasMarker(cdb, "plan_verified"), "CONVERGED stamps plan_verified (DB)");
-  cdb.close();
-} else {
-  assert(fs.existsSync(convJsonFile), "CONVERGED stamps plan_verified (JSON)");
-}
-
-// Test: FAIL → no stamp
-const stampFailSession = path.join(tmpStampHome, ".claude", "sessions", "stamp-fail");
-fs.mkdirSync(stampFailSession, { recursive: true });
-
-runAdversaryStamp({
-  session_id: "stamp-fail",
-  agent_type: "adversary",
-  last_assistant_message: "Result: FAIL reason here"
-}, { USERPROFILE: tmpStampHome, HOME: tmpStampHome });
-
-// Strict regex: "FAIL reason here" should NOT match (text after verdict on same line)
-const failDbFile = path.join(stampFailSession, "session.db");
-const failJsonFile = path.join(stampFailSession, "plan_verified");
-if (fs.existsSync(failDbFile)) {
-  const fdb = gatesDb.getDb(stampFailSession);
-  assert(!gatesDb.hasMarker(fdb, "plan_verified"), "FAIL with trailing text does not stamp");
-  fdb.close();
-} else {
-  assert(!fs.existsSync(failJsonFile), "FAIL with trailing text does not stamp (JSON)");
-}
-
-// Test: clean FAIL → no stamp
-const stampCleanFailSession = path.join(tmpStampHome, ".claude", "sessions", "stamp-cleanfail");
-fs.mkdirSync(stampCleanFailSession, { recursive: true });
-
-runAdversaryStamp({
-  session_id: "stamp-cleanfail",
-  agent_type: "adversary",
-  last_assistant_message: "Result: FAIL"
-}, { USERPROFILE: tmpStampHome, HOME: tmpStampHome });
-
-const cleanFailDbFile = path.join(stampCleanFailSession, "session.db");
-const cleanFailJsonFile = path.join(stampCleanFailSession, "plan_verified");
-if (fs.existsSync(cleanFailDbFile)) {
-  const cfdb = gatesDb.getDb(stampCleanFailSession);
-  assert(!gatesDb.hasMarker(cfdb, "plan_verified"), "clean FAIL does not stamp");
-  cfdb.close();
-} else {
-  assert(!fs.existsSync(cleanFailJsonFile), "clean FAIL does not stamp (JSON)");
-}
-
-// Test: REVISE → no stamp
-const stampReviseSession = path.join(tmpStampHome, ".claude", "sessions", "stamp-revise");
-fs.mkdirSync(stampReviseSession, { recursive: true });
-
-runAdversaryStamp({
-  session_id: "stamp-revise",
-  agent_type: "adversary",
-  last_assistant_message: "Result: REVISE"
-}, { USERPROFILE: tmpStampHome, HOME: tmpStampHome });
-
-const reviseDbFile = path.join(stampReviseSession, "session.db");
-const reviseJsonFile = path.join(stampReviseSession, "plan_verified");
-if (fs.existsSync(reviseDbFile)) {
-  const rdb = gatesDb.getDb(stampReviseSession);
-  assert(!gatesDb.hasMarker(rdb, "plan_verified"), "REVISE does not stamp");
-  rdb.close();
-} else {
-  assert(!fs.existsSync(reviseJsonFile), "REVISE does not stamp (JSON)");
-}
-
-// Test: non-adversary agent → no-op
-const stampNonAdvSession = path.join(tmpStampHome, ".claude", "sessions", "stamp-nonadv");
-fs.mkdirSync(stampNonAdvSession, { recursive: true });
-
-runAdversaryStamp({
-  session_id: "stamp-nonadv",
-  agent_type: "implementer",
-  last_assistant_message: "Result: PASS"
-}, { USERPROFILE: tmpStampHome, HOME: tmpStampHome });
-
-const nonAdvDbFile = path.join(stampNonAdvSession, "session.db");
-const nonAdvJsonFile = path.join(stampNonAdvSession, "plan_verified");
-if (fs.existsSync(nonAdvDbFile)) {
-  const nadb = gatesDb.getDb(stampNonAdvSession);
-  assert(!gatesDb.hasMarker(nadb, "plan_verified"), "non-adversary agent does not stamp");
-  nadb.close();
-} else {
-  assert(!fs.existsSync(nonAdvJsonFile), "non-adversary agent does not stamp (JSON)");
-}
-
-// Test: strict regex rejects "Result: PASS with caveats"
-const stampCaveatSession = path.join(tmpStampHome, ".claude", "sessions", "stamp-caveat");
-fs.mkdirSync(stampCaveatSession, { recursive: true });
-
-runAdversaryStamp({
-  session_id: "stamp-caveat",
-  agent_type: "adversary",
-  last_assistant_message: "Result: PASS with caveats"
-}, { USERPROFILE: tmpStampHome, HOME: tmpStampHome });
-
-const caveatDbFile = path.join(stampCaveatSession, "session.db");
-const caveatJsonFile = path.join(stampCaveatSession, "plan_verified");
-if (fs.existsSync(caveatDbFile)) {
-  const cvdb = gatesDb.getDb(stampCaveatSession);
-  assert(!gatesDb.hasMarker(cvdb, "plan_verified"), "strict regex rejects 'PASS with caveats'");
-  cvdb.close();
-} else {
-  assert(!fs.existsSync(caveatJsonFile), "strict regex rejects 'PASS with caveats' (JSON)");
-}
-
-fs.rmSync(tmpStampHome, { recursive: true, force: true });
+// Cleanup temp config files
+try { fs.unlinkSync(commitDisabledConfig); } catch {}
+try { fs.unlinkSync(commitEnabledConfig); } catch {}
+try { fs.unlinkSync(commitPassConfig); } catch {}
 
 // ── edit-gate enhancements ─────────────────────────────────────────────
 
@@ -1569,6 +1490,118 @@ if (esDb) {
   console.log("  SKIP: edit_stats tests — better-sqlite3 not available");
 }
 fs.rmSync(tmpEditStats, { recursive: true, force: true });
+
+// ── SQLite DB: scope_gates operations ─────────────────────────────────
+
+describe("SQLite DB: scope_gates operations");
+
+const tmpGates = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-scopegates-"));
+const gDb = gatesDb.getDb(tmpGates);
+if (gDb) {
+  // Verify table exists
+  const gtTables = gDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='scope_gates'").get();
+  assert(!!gtTables, "scope_gates table exists");
+
+  // initGates creates correct rows
+  gatesDb.initGates(gDb, "task-1", "implementer", [
+    { agent: "reviewer", maxRounds: 3 },
+    { agent: "playtester", maxRounds: 2 }
+  ]);
+  const allGates = gatesDb.getGates(gDb, "task-1");
+  assert(allGates.length === 2, "initGates creates 2 rows");
+  assert(allGates[0].status === "active", "first gate is active");
+  assert(allGates[0].gate_agent === "reviewer", "first gate is reviewer");
+  assert(allGates[1].status === "pending", "second gate is pending");
+  assert(allGates[0].source_agent === "implementer", "source_agent recorded");
+
+  // Double initGates is no-op
+  gatesDb.initGates(gDb, "task-1", "implementer", [{ agent: "other", maxRounds: 1 }]);
+  const afterDouble = gatesDb.getGates(gDb, "task-1");
+  assert(afterDouble.length === 2, "double initGates is no-op");
+
+  // getActiveGate
+  const active = gatesDb.getActiveGate(gDb, "task-1");
+  assert(active && active.gate_agent === "reviewer", "getActiveGate returns reviewer");
+
+  // getReviseGate (none yet)
+  assert(gatesDb.getReviseGate(gDb, "task-1") === null, "no revise gate initially");
+
+  // hasActiveGates
+  assert(gatesDb.hasActiveGates(gDb, "task-1") === true, "hasActiveGates true initially");
+
+  // passGate: advance to next
+  const passResult = gatesDb.passGate(gDb, "task-1", 0);
+  assert(passResult.nextGate && passResult.nextGate.gate_agent === "playtester", "passGate activates next");
+  assert(passResult.allPassed === false, "not all passed yet");
+  const afterPass = gatesDb.getGates(gDb, "task-1");
+  assert(afterPass[0].status === "passed", "first gate is now passed");
+  assert(afterPass[1].status === "active", "second gate is now active");
+
+  // passGate: last gate
+  const passResult2 = gatesDb.passGate(gDb, "task-1", 1);
+  assert(passResult2.nextGate === undefined || passResult2.nextGate === null, "no next gate");
+  assert(passResult2.allPassed === true, "all gates passed");
+  assert(gatesDb.hasActiveGates(gDb, "task-1") === false, "hasActiveGates false after all pass");
+
+  // Test revise flow in a new scope
+  gatesDb.initGates(gDb, "task-2", "worker", [
+    { agent: "checker", maxRounds: 2 }
+  ]);
+  const revResult = gatesDb.reviseGate(gDb, "task-2", 0);
+  assert(revResult && revResult.status === "revise", "reviseGate sets status to revise");
+  assert(revResult && revResult.round === 1, "reviseGate increments round to 1");
+
+  const revGate = gatesDb.getReviseGate(gDb, "task-2");
+  assert(revGate && revGate.gate_agent === "checker", "getReviseGate returns checker");
+
+  // reactivateReviseGate
+  const reactivated = gatesDb.reactivateReviseGate(gDb, "task-2");
+  assert(reactivated === true, "reactivateReviseGate returns true");
+  const afterReactivate = gatesDb.getActiveGate(gDb, "task-2");
+  assert(afterReactivate && afterReactivate.gate_agent === "checker", "gate reactivated to active");
+
+  // reviseGate at max rounds → failed
+  const revResult2 = gatesDb.reviseGate(gDb, "task-2", 0);
+  assert(revResult2 && revResult2.status === "failed", "reviseGate at maxRounds sets failed");
+  assert(revResult2 && revResult2.round === 2, "round is 2 (max was 2)");
+
+  gDb.close();
+} else {
+  console.log("  SKIP: scope_gates tests — better-sqlite3 not available");
+}
+fs.rmSync(tmpGates, { recursive: true, force: true });
+
+// ── plan-gate: iteration cap ──────────────────────────────────────────
+
+describe("plan-gate: iteration cap (MAX_ATTEMPTS=3)");
+
+const tmpIterHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-iter-"));
+const iterPlanDir = path.join(tmpIterHome, ".claude", "plans");
+fs.mkdirSync(iterPlanDir, { recursive: true });
+fs.writeFileSync(path.join(iterPlanDir, "big-plan.md"), Array.from({ length: 30 }, (_, i) => `Line ${i}`).join("\n"), "utf-8");
+
+// Attempt 1 → block
+const iter1 = runPlanGate(
+  { session_id: "iter-test" },
+  { USERPROFILE: tmpIterHome, HOME: tmpIterHome }
+);
+assert(iter1.stdout.includes("block"), "attempt 1 blocks");
+
+// Attempt 2 → block
+const iter2 = runPlanGate(
+  { session_id: "iter-test" },
+  { USERPROFILE: tmpIterHome, HOME: tmpIterHome }
+);
+assert(iter2.stdout.includes("block"), "attempt 2 blocks");
+
+// Attempt 3 → auto-allow (resets counter)
+const iter3 = runPlanGate(
+  { session_id: "iter-test" },
+  { USERPROFILE: tmpIterHome, HOME: tmpIterHome }
+);
+assert(!iter3.stdout.includes("block"), "attempt 3 auto-allows");
+
+fs.rmSync(tmpIterHome, { recursive: true, force: true });
 
 // ── Summary ─────────────────────────────────────────────────────────
 

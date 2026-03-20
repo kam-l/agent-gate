@@ -4,18 +4,17 @@ Declarative pipeline gates for Claude Code agents. Two YAML fields enforce order
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-blueviolet)](https://code.claude.com/docs/en/plugins)
-[![Tests: 179 passing](https://img.shields.io/badge/tests-179_passing-green)]()
-[![Version: 2.1.0](https://img.shields.io/badge/version-2.1.0-blue)]()
+[![Tests: 213 passing](https://img.shields.io/badge/tests-213_passing-green)]()
+[![Version: 2.3.0](https://img.shields.io/badge/version-2.3.0-blue)]()
 
 ```yaml
 ---
-name: reviewer
-requires: ["implementer", "cleaner"]
+name: implementer
 verification: |
-  Evaluate whether this demonstrates genuine critical analysis.
-  Reply EXACTLY on the last line: PASS or FAIL followed by your reason.
-on_revise: fixer
-max_rounds: 3
+  Does this show real implementation? Reply: PASS or FAIL + reason.
+gates:
+  - [reviewer, 3]
+  - [playtester, 3]
 ---
 ```
 
@@ -31,15 +30,15 @@ Multi-agent pipelines break in two ways: agents run out of order, or they produc
 
 - **`requires:`** — block agents until dependencies complete
 - **`verification:`** — LLM-as-judge semantic quality check
-- **`on_revise:`** — auto-route failed agents to a remediation agent
-- **`max_rounds:`** — cap retry loops with round tracking
+- **`conditions:`** — semantic pre-check before agent spawns
+- **`gates:`** — ordered post-completion gate chain with automatic enforcement
 - **Deterministic layer** — file exists, `Result:` line present
 - **Semantic layer** — `claude -p` catches placeholder content
-- **Plan gate** — blocks ExitPlanMode until adversary verifies the plan
-- **Adversary stamp** — auto-stamps session on adversary PASS/CONVERGED
-- **Commit nudge** — stderr warning at 10 files or 200 lines uncommitted
+- **Plan gate** — blocks ExitPlanMode until gater verdict found (auto-allows after 3 attempts)
+- **Commit gate** — pre-commit validation via configurable commands (opt-in)
+- **Commit nudge** — stderr warning at configurable file/line thresholds
 - **Loop detection** — blocks 3rd consecutive identical tool call
-- **Debug cleanup** — catches leftover debug markers before session ends
+- **Debug cleanup** — configurable patterns + custom commands at session end (default: warn)
 - **Artifact completeness** — warns about incomplete agents in active scopes
 - **Atomic state** — SQLite WAL mode eliminates race conditions (optional)
 - **Fail-open** — bugs degrade to no gating, never to data loss
@@ -117,23 +116,11 @@ Structural gates catch forgotten artifacts. Semantic gates catch lazy content th
 | `claude-gates-conditions.js` | PreToolUse:Agent | Check `requires:` before spawn, register scope |
 | `claude-gates-injection.js` | SubagentStart | Inject `output_filepath` via `<agent_gate>` tag |
 | `claude-gates-verification.js` | SubagentStop | Structural + semantic validation, verdict recording |
-| `plan-gate.js` | PreToolUse:ExitPlanMode | Block until plan verified by adversary |
-| `adversary-stamp.js` | SubagentStop | Stamp session on adversary PASS/CONVERGED |
-| `edit-gate.js` | PostToolUse:Edit\|Write | Track edited files, nudge at commit thresholds |
+| `plan-gate.js` | PreToolUse:ExitPlanMode | Verdict-based: checks for gater PASS in session_scopes |
+| `commit-gate.js` | PreToolUse:Bash | Pre-commit validation (opt-in via config) |
+| `edit-gate.js` | PostToolUse:Edit\|Write | Track edited files, nudge at configurable thresholds |
 | `loop-gate.js` | PreToolUse:Bash\|Edit\|Write | Break infinite loops of identical calls |
-| `stop-gate.js` | Stop | Artifact completeness + debug leftover scan |
-
-### Retry Orchestration
-
-```yaml
----
-name: reviewer
-on_revise: fixer      # spawn this agent on REVISE verdict
-max_rounds: 3         # cap at 3 rounds
----
-```
-
-Verdicts are tracked as structured objects with round numbers. The orchestrator reads `session_scopes.json` (or SQLite DB) to decide retry/escalation.
+| `stop-gate.js` | Stop | Configurable debug scan + custom commands (default: warn) |
 
 ### Artifact Convention
 
@@ -146,24 +133,24 @@ Agents sharing a `scope` write to the same directory and can read each other's o
 ## Architecture
 
 ```
-.claude-plugin/plugin.json           <- Plugin manifest (v2.1.0)
+.claude-plugin/plugin.json           <- Plugin manifest (v2.3.0)
 hooks/hooks.json                     <- Hook registration (${CLAUDE_PLUGIN_ROOT})
 scripts/
   claude-gates-shared.js             <- Core parsers (zero deps)
   claude-gates-db.js                 <- SQLite session state (optional)
+  claude-gates-config.js             <- Project-level config loader
   claude-gates-conditions.js         <- PreToolUse:Agent — dependency check
   claude-gates-injection.js          <- SubagentStart — filepath injection
   claude-gates-verification.js       <- SubagentStop — two-layer verification
-  claude-gates-compat.js             <- Legacy gate: schema support
-  plan-gate.js                       <- PreToolUse:ExitPlanMode — plan verification gate
-  adversary-stamp.js                 <- SubagentStop — adversary verdict stamping
+  plan-gate.js                       <- PreToolUse:ExitPlanMode — verdict-based plan gate
+  commit-gate.js                     <- PreToolUse:Bash — pre-commit validation (opt-in)
   edit-gate.js                       <- PostToolUse:Edit|Write — file tracking + commit nudge
   loop-gate.js                       <- PreToolUse:Bash|Edit|Write — loop detection
-  stop-gate.js                       <- Stop — artifact completeness + debug scan
-  claude-gates-test.js               <- Test suite (179 tests)
+  stop-gate.js                       <- Stop — configurable debug scan + commands
+  claude-gates-test.js               <- Test suite (213 tests)
 skills/claude-gates/SKILL.md         <- System-triggered skill
 commands/verify.md                   <- /verify command
-agents/adversary.md                  <- Adversary agent
+agents/gater.md                      <- Gater agent (stress-tester)
 ```
 
 ### Session State (Dual-Path)
@@ -176,12 +163,36 @@ agents/adversary.md                  <- Adversary agent
 
 `better-sqlite3` is in `optionalDependencies` — native compilation failure doesn't break install.
 
+### Project Configuration
+
+Optional `claude-gates.json` at repo root:
+
+```json
+{
+  "stop_gate": {
+    "patterns": ["TODO", "HACK", "FIXME", "console.log"],
+    "commands": ["dotnet build"],
+    "mode": "warn"
+  },
+  "commit_gate": {
+    "commands": ["npm test"],
+    "enabled": true
+  },
+  "edit_gate": {
+    "file_threshold": 10,
+    "line_threshold": 200
+  }
+}
+```
+
+All fields optional — missing fields use defaults. No config file = built-in defaults.
+
 ## Testing
 
 ```bash
 node scripts/claude-gates-test.js
-# With better-sqlite3:    179 passed, 0 failed
-# Without better-sqlite3: 120 passed, 0 failed (SQLite tests skipped)
+# With better-sqlite3:    213 passed, 0 failed
+# Without better-sqlite3: ~140 passed, 0 failed (SQLite tests skipped)
 ```
 
 ## License

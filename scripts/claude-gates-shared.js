@@ -2,15 +2,15 @@
 /**
  * ClaudeGates v2 — shared module.
  *
- * Parsers for YAML frontmatter fields (requires, verification, on_revise, max_rounds)
- * with backward compatibility for the old gate: block schema.
+ * Parsers for YAML frontmatter fields (requires, verification, conditions, gates).
  *
  * Exports:
  *   extractFrontmatter(mdContent)  → string | null
  *   parseRequires(mdContent)       → string[] | null
  *   parseVerification(mdContent)   → string | null
- *   parseOnRevise(mdContent)       → string | null
- *   parseMaxRounds(mdContent)      → number | null
+ *   parseConditions(mdContent)     → string | null
+ *   parseGates(mdContent)          → Array<{ agent, maxRounds }> | null
+ *   requiresScope(mdContent)       → boolean
  *   findAgentMd(agentType, projectRoot, home) → string | null
  *   VERDICT_RE                     → RegExp
  */
@@ -69,15 +69,13 @@ function parseRequires(mdContent) {
 
 /**
  * Parse verification: prompt from agent YAML frontmatter.
- * New schema: top-level `verification: |` multiline block.
- * Falls back to old `gate.prompt` for backward compatibility.
+ * Schema: top-level `verification: |` multiline block.
  * Returns the prompt string or null.
  */
 function parseVerification(mdContent) {
   const fm = extractFrontmatter(mdContent);
   if (!fm) return null;
 
-  // New schema: verification: | (multiline block scalar)
   const vMatch = fm.match(/^verification:\s*\|\s*\r?\n((?:[ ]{2,}.*\r?\n?)+)/m);
   if (vMatch) {
     return vMatch[1]
@@ -87,43 +85,64 @@ function parseVerification(mdContent) {
       .trim();
   }
 
-  // Fallback: old gate.prompt schema
-  const gateMatch = fm.match(/^gate:\s*\r?\n((?:[ ]{2,}.*\r?\n?)*)/m);
-  if (gateMatch) {
-    const gb = gateMatch[1];
-    const pm = gb.match(/^\s+prompt:\s*\|\s*\r?\n((?:\s{4,}.*\r?\n?)+)/m);
-    if (pm) {
-      return pm[1]
-        .split(/\r?\n/)
-        .map(line => line.replace(/^ {4}/, ""))
-        .join("\n")
-        .trim();
-    }
-  }
-
   return null;
 }
 
 /**
- * Parse on_revise: field from agent YAML frontmatter.
- * Returns the designated remediation agent type, or null.
+ * Parse conditions: prompt from agent YAML frontmatter.
+ * Semantic pre-check run BEFORE the agent spawns.
+ * Same format as verification: (block scalar with |).
+ * Returns the prompt string or null.
  */
-function parseOnRevise(mdContent) {
+function parseConditions(mdContent) {
   const fm = extractFrontmatter(mdContent);
   if (!fm) return null;
-  const match = fm.match(/^on_revise:\s*["']?([A-Za-z0-9_-]+)["']?\s*$/m);
-  return match ? match[1] : null;
+  const cMatch = fm.match(/^conditions:\s*\|\s*\r?\n((?:[ ]{2,}.*\r?\n?)+)/m);
+  if (cMatch) {
+    return cMatch[1]
+      .split(/\r?\n/)
+      .map(line => line.replace(/^ {2}/, ""))
+      .join("\n")
+      .trim();
+  }
+  return null;
 }
 
 /**
- * Parse max_rounds: field from agent YAML frontmatter.
- * Returns the integer value, or null.
+ * Parse gates: field from agent YAML frontmatter.
+ * Format:
+ *   gates:
+ *     - [reviewer, 3]
+ *     - [playtester, 3]
+ *
+ * Returns Array<{ agent: string, maxRounds: number }> or null.
  */
-function parseMaxRounds(mdContent) {
+function parseGates(mdContent) {
   const fm = extractFrontmatter(mdContent);
   if (!fm) return null;
-  const match = fm.match(/^max_rounds:\s*(\d+)\s*$/m);
-  return match ? parseInt(match[1], 10) : null;
+
+  const blockMatch = fm.match(/^gates:\s*\r?\n((?:\s+-\s*.*\r?\n?)+)/m);
+  if (!blockMatch) return null;
+
+  const gates = [];
+  for (const line of blockMatch[1].split(/\r?\n/)) {
+    const m = line.match(/^\s+-\s*\[\s*["']?([A-Za-z0-9_-]+)["']?\s*,\s*(\d+)\s*\]/);
+    if (m) {
+      gates.push({ agent: m[1], maxRounds: parseInt(m[2], 10) });
+    }
+  }
+  return gates.length > 0 ? gates : null;
+}
+
+/**
+ * Check whether agent definition requires a scope for gating.
+ * Returns true if frontmatter contains gates: or requires:.
+ * Note: verification: alone does NOT require scope (backward compatible).
+ */
+function requiresScope(mdContent) {
+  const fm = extractFrontmatter(mdContent);
+  if (!fm) return false;
+  return /^(gates|requires|conditions)\s*:/m.test(fm);
 }
 
 /**
@@ -142,4 +161,4 @@ function findAgentMd(agentType, projectRoot, home) {
   return null;
 }
 
-module.exports = { extractFrontmatter, parseRequires, parseVerification, parseOnRevise, parseMaxRounds, findAgentMd, VERDICT_RE };
+module.exports = { extractFrontmatter, parseRequires, parseVerification, parseConditions, parseGates, requiresScope, findAgentMd, VERDICT_RE };

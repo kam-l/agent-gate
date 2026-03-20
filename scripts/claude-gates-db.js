@@ -10,8 +10,8 @@
  *   getDb(sessionDir)                              → Database | null
  *   ensureScope(db, scope)                         → void
  *   setClearedBoolean(db, scope, agent)            → void
- *   setCleared(db, scope, agent, verdictObj)       → void
- *   getCleared(db, scope, agent)                   → object | true | null
+ *   setCleared(db, scope, agent, verdictObj)       → void  (verdictObj: { verdict, round })
+ *   getCleared(db, scope, agent)                   → { verdict, round } | true | null
  *   isCleared(db, scope, agent)                    → boolean
  *   findClearedScope(db, agent)                    → string | null
  *   setPending(db, agent, scope, filepath)         → void
@@ -47,8 +47,6 @@ CREATE TABLE IF NOT EXISTS cleared (
   agent     TEXT NOT NULL,
   verdict   TEXT,
   round     INTEGER,
-  max       INTEGER,
-  on_revise TEXT,
   PRIMARY KEY (scope, agent)
 );
 
@@ -76,6 +74,17 @@ CREATE TABLE IF NOT EXISTS markers (
 CREATE TABLE IF NOT EXISTS edit_stats (
   key   TEXT PRIMARY KEY,
   value INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS scope_gates (
+  scope        TEXT NOT NULL,
+  seq          INTEGER NOT NULL,
+  gate_agent   TEXT NOT NULL,
+  max_rounds   INTEGER NOT NULL DEFAULT 3,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  round        INTEGER NOT NULL DEFAULT 0,
+  source_agent TEXT NOT NULL,
+  PRIMARY KEY (scope, seq)
 );
 `;
 
@@ -158,8 +167,8 @@ function migrateFromJson(sessionDir, db) {
           for (const [agent, val] of Object.entries(info.cleared)) {
             if (val && typeof val === "object") {
               db.prepare(
-                "INSERT OR IGNORE INTO cleared (scope, agent, verdict, round, max, on_revise) VALUES (?, ?, ?, ?, ?, ?)"
-              ).run(scope, agent, val.verdict || null, val.round || null, val.max || null, val.on_revise || null);
+                "INSERT OR IGNORE INTO cleared (scope, agent, verdict, round) VALUES (?, ?, ?, ?)"
+              ).run(scope, agent, val.verdict || null, val.round || null);
             } else {
               // boolean true — cleared with no verdict
               db.prepare("INSERT OR IGNORE INTO cleared (scope, agent) VALUES (?, ?)").run(scope, agent);
@@ -220,25 +229,21 @@ function setClearedBoolean(db, scope, agent) {
 
 function setCleared(db, scope, agent, verdictObj) {
   db.prepare(
-    "INSERT OR REPLACE INTO cleared (scope, agent, verdict, round, max, on_revise) VALUES (?, ?, ?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO cleared (scope, agent, verdict, round) VALUES (?, ?, ?, ?)"
   ).run(
     scope, agent,
     verdictObj.verdict || null,
-    verdictObj.round || null,
-    verdictObj.max != null ? verdictObj.max : null,
-    verdictObj.on_revise || null
+    verdictObj.round || null
   );
 }
 
 function getCleared(db, scope, agent) {
-  const row = db.prepare("SELECT verdict, round, max, on_revise FROM cleared WHERE scope = ? AND agent = ?").get(scope, agent);
+  const row = db.prepare("SELECT verdict, round FROM cleared WHERE scope = ? AND agent = ?").get(scope, agent);
   if (!row) return null;
-  if (row.verdict === null && row.round === null && row.max === null && row.on_revise === null) return true;
+  if (row.verdict === null && row.round === null) return true;
   const obj = {};
   if (row.verdict !== null) obj.verdict = row.verdict;
   if (row.round !== null) obj.round = row.round;
-  if (row.max !== null) obj.max = row.max;
-  if (row.on_revise !== null) obj.on_revise = row.on_revise;
   return obj;
 }
 
@@ -317,6 +322,130 @@ function incrEditStat(db, key, delta) {
   ).run(key, delta, delta);
 }
 
+// ── Gate operations ───────────────────────────────────────────────────
+
+/**
+ * Initialize gates for a scope. Called when source agent first completes.
+ * Inserts all gates as pending, sets first to active.
+ * No-op if gates already exist for this scope.
+ */
+function initGates(db, scope, sourceAgent, gates) {
+  const init = db.transaction(() => {
+    const existing = db.prepare("SELECT 1 FROM scope_gates WHERE scope = ? LIMIT 1").get(scope);
+    if (existing) return;
+    for (let i = 0; i < gates.length; i++) {
+      const status = i === 0 ? "active" : "pending";
+      db.prepare(
+        "INSERT INTO scope_gates (scope, seq, gate_agent, max_rounds, status, round, source_agent) VALUES (?, ?, ?, ?, ?, 0, ?)"
+      ).run(scope, i, gates[i].agent, gates[i].maxRounds, status, sourceAgent);
+    }
+  });
+  init();
+}
+
+/**
+ * Get the currently active gate for a scope.
+ */
+function getActiveGate(db, scope) {
+  return db.prepare(
+    "SELECT seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates WHERE scope = ? AND status = 'active' LIMIT 1"
+  ).get(scope) || null;
+}
+
+/**
+ * Get a gate in 'revise' status for a scope.
+ */
+function getReviseGate(db, scope) {
+  return db.prepare(
+    "SELECT seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates WHERE scope = ? AND status = 'revise' LIMIT 1"
+  ).get(scope) || null;
+}
+
+/**
+ * Get all gates for a scope, ordered by seq.
+ */
+function getGates(db, scope) {
+  return db.prepare(
+    "SELECT seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates WHERE scope = ? ORDER BY seq"
+  ).all(scope);
+}
+
+/**
+ * Transition a gate to 'passed' and activate the next gate (if any).
+ * Returns { nextGate: row | null, allPassed: boolean }.
+ */
+function passGate(db, scope, seq) {
+  const result = { nextGate: null, allPassed: false };
+  const pass = db.transaction(() => {
+    db.prepare("UPDATE scope_gates SET status = 'passed' WHERE scope = ? AND seq = ?").run(scope, seq);
+    const next = db.prepare(
+      "SELECT seq FROM scope_gates WHERE scope = ? AND seq > ? AND status = 'pending' ORDER BY seq LIMIT 1"
+    ).get(scope, seq);
+    if (next) {
+      db.prepare("UPDATE scope_gates SET status = 'active' WHERE scope = ? AND seq = ?").run(scope, next.seq);
+      result.nextGate = db.prepare(
+        "SELECT seq, gate_agent, max_rounds, status, round, source_agent FROM scope_gates WHERE scope = ? AND seq = ?"
+      ).get(scope, next.seq);
+    } else {
+      const nonPassed = db.prepare(
+        "SELECT 1 FROM scope_gates WHERE scope = ? AND status != 'passed' LIMIT 1"
+      ).get(scope);
+      result.allPassed = !nonPassed;
+    }
+  });
+  pass();
+  return result;
+}
+
+/**
+ * Set a gate to 'revise' status and increment round.
+ * If round >= maxRounds, set to 'failed' instead.
+ */
+function reviseGate(db, scope, seq) {
+  let result = null;
+  const revise = db.transaction(() => {
+    const gate = db.prepare(
+      "SELECT round, max_rounds FROM scope_gates WHERE scope = ? AND seq = ?"
+    ).get(scope, seq);
+    if (!gate) return;
+    const newRound = gate.round + 1;
+    if (newRound >= gate.max_rounds) {
+      db.prepare("UPDATE scope_gates SET status = 'failed', round = ? WHERE scope = ? AND seq = ?")
+        .run(newRound, scope, seq);
+      result = { status: "failed", round: newRound };
+    } else {
+      db.prepare("UPDATE scope_gates SET status = 'revise', round = ? WHERE scope = ? AND seq = ?")
+        .run(newRound, scope, seq);
+      result = { status: "revise", round: newRound };
+    }
+  });
+  revise();
+  return result;
+}
+
+/**
+ * Reactivate a gate that was in 'revise' status (after source agent re-completes).
+ * Returns true if a gate was reactivated.
+ */
+function reactivateReviseGate(db, scope) {
+  const gate = db.prepare(
+    "SELECT seq FROM scope_gates WHERE scope = ? AND status = 'revise' LIMIT 1"
+  ).get(scope);
+  if (!gate) return false;
+  db.prepare("UPDATE scope_gates SET status = 'active' WHERE scope = ? AND seq = ?").run(scope, gate.seq);
+  return true;
+}
+
+/**
+ * Check if scope has any non-terminal gates (pending, active, revise).
+ */
+function hasActiveGates(db, scope) {
+  const row = db.prepare(
+    "SELECT 1 FROM scope_gates WHERE scope = ? AND status IN ('pending','active','revise') LIMIT 1"
+  ).get(scope);
+  return !!row;
+}
+
 // ── Composite operations ──────────────────────────────────────────────
 
 /**
@@ -353,5 +482,14 @@ module.exports = {
   setEditStat,
   incrEditStat,
   registerScope,
-  migrateFromJson
+  migrateFromJson,
+  // Gate operations
+  initGates,
+  getActiveGate,
+  getReviseGate,
+  getGates,
+  passGate,
+  reviseGate,
+  reactivateReviseGate,
+  hasActiveGates
 };
