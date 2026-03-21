@@ -1,51 +1,15 @@
 # claude-gates
 
-Declarative pipeline gates for Claude Code agents. Two YAML fields enforce ordering and quality — automatically.
+Quality gates for Claude Code agents. Your agents shall not pass without earning it.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-blueviolet)](https://code.claude.com/docs/en/plugins)
 [![Tests: 287 passing](https://img.shields.io/badge/tests-287_passing-green)]()
 [![Version: 2.6.0](https://img.shields.io/badge/version-2.6.0-blue)]()
 
-```yaml
----
-name: implementer
-verification: |
-  Does this show real implementation? Reply: PASS or FAIL + reason.
-gates:
-  - [reviewer, 3]
-  - [playtester, 3]
----
-```
-
 <p align="center">
   <img src="gandalf.png" alt="You shall not pass!" width="400">
 </p>
-
-<p align="center">
-  <img src="assets/demo.gif" alt="Demo: reviewer blocked until implementer completes, then allowed" width="800">
-</p>
-
-## Why
-
-Multi-agent pipelines break in two ways: agents run out of order, or they produce garbage that looks like output. Guard logic scattered across prompts doesn't scale. claude-gates fixes both with two YAML fields.
-
-## Features
-
-- **`requires:`** — block agents until dependencies complete
-- **`verification:`** — LLM-as-judge semantic quality check
-- **`conditions:`** — semantic pre-check before agent spawns
-- **`gates:`** — ordered post-completion gate chain with automatic enforcement
-- **Deterministic layer** — file exists, `Result:` line present
-- **Semantic layer** — `claude -p` catches placeholder content
-- **Plan gate** — blocks ExitPlanMode until gater verdict found (auto-allows after 3 attempts)
-- **Commit gate** — pre-commit validation via configurable commands (opt-in)
-- **Commit nudge** — stderr warning at configurable file/line thresholds
-- **Loop detection** — blocks 3rd consecutive identical tool call
-- **Debug cleanup** — configurable patterns + custom commands at session end (default: warn)
-- **Artifact completeness** — warns about incomplete agents in active scopes
-- **Atomic state** — SQLite WAL mode eliminates race conditions
-- **Fail-open** — bugs degrade to no gating, never to data loss
 
 ## Install
 
@@ -55,128 +19,211 @@ claude plugin install claude-gates
 cd ~/.claude/plugins/cache/claude-gates && npm install
 ```
 
-Requires `better-sqlite3` for session state. Prebuilt binaries ship for Windows/macOS/Linux x64+arm64 — no compiler needed. If `npm install` fails, all gate hooks will warn loudly and fall back to no enforcement.
+Then run `/claude-gates:setup` to configure gates for your project.
 
-## Quick Start
+## The Gates
 
-**1. Add gates to your agent definitions:**
+Every gate is a hook that fires at a specific moment. All gates are **fail-open** — if something breaks, your work continues unblocked.
 
-```yaml
-# .claude/agents/implementer.md
 ---
-name: implementer
-verification: |
-  Does this show real implementation? Reply: PASS or FAIL + reason.
----
-```
+
+### Dependency Gate
+
+**When:** Before an agent spawns (PreToolUse:Agent)
+
+**Why:** Multi-agent pipelines break when agents run out of order. A reviewer that spawns before the implementer has nothing to review.
+
+**How it works:** Add `requires:` to your agent definition. The gate checks that each required agent's artifact exists before allowing the spawn.
 
 ```yaml
 # .claude/agents/reviewer.md
 ---
 name: reviewer
 requires: ["implementer"]
-verification: |
-  Does this show genuine critical analysis? Reply: PASS or FAIL + reason.
 ---
 ```
-
-**2. Spawn agents with a scope:**
-
-```
-Agent({ subagent_type: "implementer", prompt: "scope=task-1 Implement ..." })
-```
-
-**3. Gates enforce automatically:**
-
-```
-implementer completes -> writes task-1/implementer.md with Result: PASS
-reviewer spawns       -> conditions hook checks requires:
-                      -> implementer.md exists? -> ALLOW
-reviewer finishes     -> verification hook runs claude -p
-                      -> content is substantive? -> PASS -> done
-```
-
-If a `requires:` dependency is missing:
 
 ```
 [ClaudeGates] Cannot spawn reviewer: missing implementer.md in task-1/.
 Spawn implementer first.
 ```
 
-## How It Works
+Agents must be spawned with `scope=<name>` in the prompt so gates know which pipeline they belong to.
 
-Two enforcement layers, by design:
+---
 
-| Layer | Checks | Deterministic? |
-|-------|--------|:-:|
-| **Structural** | File exists, `Result:` line, `requires:` deps | Yes |
-| **Semantic** | `claude -p` judges content quality | No |
+### Verification Gate
 
-Structural gates catch forgotten artifacts. Semantic gates catch lazy content that passes structural checks.
+**When:** After an agent completes (SubagentStop)
 
-### Hook Pipeline
+**Why:** Agents produce garbage that looks like output. A file exists, it has content, but it's placeholder text that passed no real scrutiny.
 
-| Hook | Event | Purpose |
-|------|-------|---------|
-| `claude-gates-conditions.js` | PreToolUse:Agent | Check `requires:` before spawn, register scope |
-| `claude-gates-injection.js` | SubagentStart | Inject `output_filepath` via `<agent_gate>` tag |
-| `claude-gates-verification.js` | SubagentStop | Structural + semantic validation, verdict recording |
-| `plan-gate.js` | PreToolUse:ExitPlanMode | Verdict-based: checks for gater PASS in SQLite |
-| `plan-gate-clear.js` | PostToolUse:ExitPlanMode | Clears gater verdict so next plan needs fresh verification |
-| `commit-gate.js` | PreToolUse:Bash | Pre-commit validation (opt-in via config) |
-| `edit-gate.js` | PostToolUse:Edit\|Write | Track edited files, nudge at configurable thresholds |
-| `loop-gate.js` | PreToolUse:Bash\|Edit\|Write | Break infinite loops of identical calls |
-| `stop-gate.js` | Stop | Configurable debug scan + custom commands (default: warn) |
+**How it works:** Two layers. The **structural layer** checks that the artifact file exists and contains a `Result:` line. The **semantic layer** runs `claude -p --agent claude-gates:gater` to judge whether the content demonstrates real work.
 
-### Artifact Convention
-
-```
-~/.claude/sessions/{session_id}/{scope}/{agent_type}.md
+```yaml
+# .claude/agents/implementer.md
+---
+name: implementer
+verification: |
+  Does this show real implementation with working code?
+  Reply PASS or FAIL + reason.
+---
 ```
 
-Agents sharing a `scope` write to the same directory and can read each other's output. Last line must be `Result: PASS`, `Result: FAIL`, `Result: REVISE`, or `Result: CONVERGED`.
+The verification prompt is what the gater agent evaluates. If it says FAIL, the agent is blocked from completing until it rewrites.
 
-## Architecture
+---
 
-```
-.claude-plugin/plugin.json           <- Plugin manifest (v2.6.0)
-hooks/hooks.json                     <- Hook registration (${CLAUDE_PLUGIN_ROOT})
-scripts/
-  claude-gates-shared.js             <- Core parsers (zero deps)
-  claude-gates-db.js                 <- SQLite session state (required)
-  claude-gates-config.js             <- Project-level config loader
-  claude-gates-conditions.js         <- PreToolUse:Agent — dependency check
-  claude-gates-injection.js          <- SubagentStart — filepath injection
-  claude-gates-verification.js       <- SubagentStop — two-layer verification
-  plan-gate.js                       <- PreToolUse:ExitPlanMode — verdict-based plan gate
-  plan-gate-clear.js                 <- PostToolUse:ExitPlanMode — clears gater verdict
-  commit-gate.js                     <- PreToolUse:Bash — pre-commit validation (opt-in)
-  edit-gate.js                       <- PostToolUse:Edit|Write — file tracking + commit nudge
-  loop-gate.js                       <- PreToolUse:Bash|Edit|Write — loop detection
-  stop-gate.js                       <- Stop — configurable debug scan + commands
-  claude-gates-test.js               <- Test suite (287 tests)
-skills/claude-gates/SKILL.md         <- System-triggered skill
-agents/gater.md                      <- Universal gate agent (review, conditions, plan verification)
+### Gate Chain
+
+**When:** After a source agent completes with PASS (SubagentStop + PreToolUse:Agent)
+
+**Why:** Some artifacts need multiple reviewers in sequence — a code reviewer, then a security auditor, then a playtester. Each gate agent must pass before the next one runs.
+
+**How it works:** Add `gates:` to the source agent. After it completes, gates activate in order. Each gate agent can PASS (advance), REVISE (send back to source or fixer), or exhaust its max rounds (fail the chain).
+
+```yaml
+# .claude/agents/implementer.md
+---
+name: implementer
+gates:
+  - [reviewer, 3]
+  - [security-auditor, 2]
+  - [reviewer, 3, fixer]    # optional: route REVISE to a fixer agent
+---
 ```
 
-### Session State
+The number is max rounds. If the gate agent returns REVISE 3 times, the chain fails. The optional third element names a fixer agent that handles revisions instead of the source agent.
 
-SQLite DB (`session.db`, WAL mode) — atomic transactions, no race conditions between concurrent hooks. Auto-migrates legacy JSON state on first access.
+---
 
-### Project Configuration
+### Conditions Gate
 
-Optional `claude-gates.json` at repo root:
+**When:** Before an agent spawns (PreToolUse:Agent)
+
+**Why:** Some agents should only spawn when the prompt meets certain criteria — the right context is present, the right question is being asked.
+
+**How it works:** Add `conditions:` to your agent definition. The gater agent evaluates the spawn prompt against these conditions and returns PASS or FAIL.
+
+```yaml
+---
+name: security-auditor
+conditions: |
+  Only spawn if the prompt mentions authentication, authorization,
+  or data handling. Not for UI-only changes.
+---
+```
+
+---
+
+### Plan Gate
+
+**When:** Before exiting plan mode (PreToolUse:ExitPlanMode)
+
+**Why:** Non-trivial plans (>20 lines) should be reviewed before execution. Without this, Claude exits plan mode and starts implementing a plan that may have gaps.
+
+**How it works:** Blocks ExitPlanMode until the gater agent has reviewed the plan and returned PASS. Auto-allows after 3 attempts (safety valve). After each ExitPlanMode, the verdict is cleared so the next plan needs fresh verification.
+
+No configuration needed — works automatically. To verify a plan, spawn `claude-gates:gater` with `scope=verify-plan`.
+
+---
+
+### Commit Gate
+
+**When:** Before `git commit` (PreToolUse:Bash)
+
+**Why:** Catch issues before they're committed — run tests, linting, type checks, whatever your project needs.
+
+**How it works:** Detects `git commit` in Bash commands and runs your configured validation commands first. If any command fails, the commit is blocked.
+
+**Default: disabled.** Enable in `claude-gates.json`:
+
+```json
+{
+  "commit_gate": {
+    "commands": ["npm test", "npm run lint"],
+    "enabled": true
+  }
+}
+```
+
+---
+
+### Edit Gate
+
+**When:** After every file edit (PostToolUse:Edit|Write)
+
+**Why:** Large uncommitted changesets are risky. A nudge at the right moment prevents sprawling diffs.
+
+**How it works:** Tracks edited files and computes git diff stats. When thresholds are exceeded, prints a stderr reminder to commit.
+
+**Default: 10 files or 200 lines.** Configure in `claude-gates.json`:
+
+```json
+{
+  "edit_gate": {
+    "file_threshold": 15,
+    "line_threshold": 300
+  }
+}
+```
+
+Never blocks — stderr nudge only.
+
+---
+
+### Loop Gate
+
+**When:** Before Bash, Edit, or Write (PreToolUse:Bash|Edit|Write)
+
+**Why:** Agents get stuck in loops — running the same command, making the same edit, writing the same file. Three identical consecutive calls means something is wrong.
+
+**How it works:** Hashes `tool_name + tool_input`. If the same hash appears 3 times in a row, blocks with a message to change approach. A different call resets the counter.
+
+No configuration — always active.
+
+---
+
+### Stop Gate
+
+**When:** At session end (Stop)
+
+**Why:** Debug leftovers ship to production. `console.log`, `TODO`, `HACK` — patterns that belong in development, not in committed code.
+
+**How it works:** Scans all files edited during the session for configurable patterns. Two modes: **warn** (stderr, default) or **nudge** (blocks once, second stop passes).
+
+**Default patterns:** `TODO`, `HACK`, `FIXME`, `console.log`. Configure in `claude-gates.json`:
+
+```json
+{
+  "stop_gate": {
+    "patterns": ["TODO", "HACK", "FIXME", "console.log", "debugger"],
+    "commands": ["dotnet build"],
+    "mode": "nudge"
+  }
+}
+```
+
+`commands` run at session end — useful for build verification. `mode: "nudge"` blocks the first stop so you can clean up; stopping again proceeds.
+
+---
+
+## Configuration
+
+All gates are configured via optional `claude-gates.json` at your repo root. Run `/claude-gates:setup` to generate one interactively.
+
+Missing fields use defaults. No config file = built-in defaults. All gates work without any configuration.
 
 ```json
 {
   "stop_gate": {
     "patterns": ["TODO", "HACK", "FIXME", "console.log"],
-    "commands": ["dotnet build"],
+    "commands": [],
     "mode": "warn"
   },
   "commit_gate": {
-    "commands": ["npm test"],
-    "enabled": true
+    "commands": [],
+    "enabled": false
   },
   "edit_gate": {
     "file_threshold": 10,
@@ -185,7 +232,9 @@ Optional `claude-gates.json` at repo root:
 }
 ```
 
-All fields optional — missing fields use defaults. No config file = built-in defaults.
+## Agents
+
+**Gater** (`claude-gates:gater`) — the universal quality gate agent. Handles artifact review, conditions pre-checks, and plan verification. Read-only evaluator with tools restricted to Read, Grep, Glob, and read-only Bash. Returns `Result: PASS`, `REVISE`, `CONVERGED`, or `FAIL`.
 
 ## Testing
 
