@@ -396,11 +396,14 @@ function runGatesOnlyCheck(artifactInfo, sessionDir, agentType, mdContent, db) {
 function processGateTransitions(db, scope, agentType, finalVerdict, mdContent) {
   if (!db || !scope) return;
 
+  // Normalize to bare agent type — gates table stores bare names (from conditions hook)
+  const bare = agentType.includes(":") ? agentType.split(":").pop() : agentType;
+
   const gates = gatesDb.getGates(db, scope);
 
   if (gates.length > 0) {
     // Case 1: This agent IS an active gate agent
-    const activeGate = gates.find(g => g.gate_agent === agentType && g.status === "active");
+    const activeGate = gates.find(g => g.gate_agent === bare && g.status === "active");
     if (activeGate) {
       if (finalVerdict === "PASS" || finalVerdict === "CONVERGED") {
         const { nextGate, allPassed } = gatesDb.passGate(db, scope, activeGate.order);
@@ -431,28 +434,28 @@ function processGateTransitions(db, scope, agentType, finalVerdict, mdContent) {
     }
 
     // Case 2a: This agent is the FIXER agent for a gate in fix status
-    const fixGateRow = gates.find(g => g.fixer_agent === agentType && g.status === "fix");
+    const fixGateRow = gates.find(g => g.fixer_agent === bare && g.status === "fix");
     if (fixGateRow) {
       const reactivated = gatesDb.reactivateFixGate(db, scope);
       if (reactivated) {
-        process.stderr.write(`[ClaudeGates] Fixer agent "${agentType}" completed. Gate reactivated for re-run.\n`);
+        process.stderr.write(`[ClaudeGates] Fixer agent "${bare}" completed. Gate reactivated for re-run.\n`);
       }
       return;
     }
 
     // Case 2b: This agent is the SOURCE agent for gates in revise status
     const sourceAgent = gates[0].source_agent;
-    if (sourceAgent === agentType) {
+    if (sourceAgent === bare) {
       const reactivated = gatesDb.reactivateReviseGate(db, scope);
       if (reactivated) {
-        process.stderr.write(`[ClaudeGates] Source agent "${agentType}" re-completed. Gate reactivated for re-run.\n`);
+        process.stderr.write(`[ClaudeGates] Source agent "${bare}" re-completed. Gate reactivated for re-run.\n`);
       }
     }
   } else {
     // No gates in DB yet — check if this agent defines gates (first completion)
     const agentGates = parseGates(mdContent);
     if (agentGates && (finalVerdict === "PASS" || finalVerdict === "CONVERGED")) {
-      gatesDb.initGates(db, scope, agentType, agentGates);
+      gatesDb.initGates(db, scope, bare, agentGates);
       process.stderr.write(
         `[ClaudeGates] Initialized ${agentGates.length} gate(s) for scope "${scope}": ${agentGates.map(g => g.agent).join(" -> ")}. ` +
         `Next: spawn ${agentGates[0].agent} with scope=${scope}.\n`
