@@ -3,7 +3,7 @@
 Quality gates for Claude Code agents. Your agents shall not pass without earning it.
 
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-blueviolet)](https://code.claude.com/docs/en/plugins)
-[![Gates: 8](https://img.shields.io/badge/gates-8-orange)]()
+[![Gates: 7](https://img.shields.io/badge/gates-7-orange)]()
 [![Tests](https://github.com/kam-l/claude-gates/actions/workflows/test.yml/badge.svg)](https://github.com/kam-l/claude-gates/actions/workflows/test.yml)
 [![Version](https://img.shields.io/github/v/tag/kam-l/claude-gates?label=version)](https://github.com/kam-l/claude-gates/releases)
 
@@ -22,35 +22,74 @@ Then I tried prompt engineering my own subagents. Wrote aggressive instructions.
 
 claude-gates moves quality control from "please do this" to "you literally cannot proceed without doing this." Every gate is a hook that fires at a deterministic moment in the agent lifecycle. No amount of prompt-following variance can bypass a `PreToolUse` block.
 
+## Install
+
+```bash
+claude plugin marketplace add kam-l/claude-gates
+claude plugin install claude-gates
+cd ~/.claude/plugins/cache/claude-gates && npm install
+```
+
+Then run `/claude-gates:setup` to configure gates for your project.
+
+## Quick Start
+
+Add `verification:` to any agent definition:
+
+```yaml
+# .claude/agents/implementer.md
+---
+name: implementer
+verification: |
+  Does this show real implementation with working code?
+  Reply PASS or FAIL + reason.
+---
+```
+
+That's it. The agent's output will be judged by the gater before the pipeline continues. Spawn with `scope=<name>` so gates know which pipeline it belongs to.
+
 ## Gate Lifecycle
 
 Every agent spawn passes through a deterministic pipeline. Gates fire at hook boundaries — not prompt-level, hook-level.
 
-```mermaid
-flowchart TD
-    A([Agent spawn requested]) --> B{conditions:}
-    B -->|FAIL| Z[⛔ Blocked]
-    B -->|PASS / none| C{requires:}
-    C -->|missing artifact| Z
-    C -->|satisfied| D[SubagentStart · inject output path]
-    D --> E([Agent executes])
-    E --> F{verification:}
-    F -->|structural fail| G[REVISE → agent rewrites]
-    F -->|semantic fail| G
-    G --> E
-    F -->|PASS| H{gates: chain?}
-    H -->|none| K([✅ Complete])
-    H -->|has gates| I[Gate agent reviews]
-    I -->|PASS| J{next gate?}
-    J -->|yes| I
-    J -->|no| K
-    I -->|REVISE| L[Source / fixer rewrites]
-    L --> I
-    I -->|max rounds| Z
-
-    style Z fill:#d32f2f,color:#fff
-    style K fill:#388e3c,color:#fff
-    style E fill:#1565c0,color:#fff
+```
+         Agent spawns
+              │
+     has conditions: ? ─── NO ─────────────────────────────┐
+              │                                             │
+             YES                                            │
+              │                                             │
+        gater evaluates ─── FAIL ──→ ⛔ Blocked             │
+              │                      orchestrator forced    │
+             PASS                    to adjust              │
+              │                                             │
+              │◄────────────────────────────────────────────┘
+         Agent executes
+              │
+        writes artifact
+              │
+     has verification: ? ── NO ────────────────────────────┐
+              │                                             │
+             YES                                            │
+              │                                             │
+        gater evaluates ─── FAIL ──→ 🔄 REVISE ────────┐   │
+              │                      agent rewrites     │   │
+             PASS                    and retries        │   │
+              │◄────────────────────────────────────────┘   │
+              │◄────────────────────────────────────────────┘
+        has gates: ? ────── NO ──────→ ✅ Complete
+              │
+             YES
+              │
+        reviewer agent ──── 🔄 REVISE ──→ agent rewrites ──┐
+              │                           and retries gate  │
+             PASS                                           │
+              │◄────────────────────────────────────────────┘
+        security agent
+              │
+             PASS
+              │
+         ✅ Complete
 ```
 
 Session-level gates run independently of the agent pipeline:
@@ -63,44 +102,9 @@ Session-level gates run independently of the agent pipeline:
 | **Loop** | `Bash` · `Edit` · `Write` | Kill 3× identical calls |
 | **Stop** | session end | Catch debug leftovers |
 
-## Install
-
-```bash
-claude plugin marketplace add kam-l/claude-gates
-claude plugin install claude-gates
-cd ~/.claude/plugins/cache/claude-gates && npm install
-```
-
-Then run `/claude-gates:setup` to configure gates for your project.
-
 ## The Gates
 
 Every gate is a hook that fires at a specific moment. All gates are **fail-open** — if something breaks, your work continues unblocked.
-
----
-
-### Dependency Gate
-
-**When:** Before an agent spawns (PreToolUse:Agent)
-
-**Why:** Multi-agent pipelines break when agents run out of order. A reviewer that spawns before the implementer has nothing to review.
-
-**How it works:** Add `requires:` to your agent definition. The gate checks that each required agent's artifact exists before allowing the spawn.
-
-```yaml
-# .claude/agents/reviewer.md
----
-name: reviewer
-requires: ["implementer"]
----
-```
-
-```
-[ClaudeGates] Cannot spawn reviewer: missing implementer.md in task-1/.
-Spawn implementer first.
-```
-
-Agents must be spawned with `scope=<name>` in the prompt so gates know which pipeline they belong to.
 
 ---
 

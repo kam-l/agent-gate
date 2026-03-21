@@ -1,6 +1,6 @@
 # claude-gates
 
-Declarative pipeline gates — `requires:`, `verification:`, `conditions:`, and `gates:` fields in agent frontmatter.
+Declarative pipeline gates — `verification:`, `conditions:`, and `gates:` fields in agent frontmatter.
 
 ## Key Invariants
 
@@ -25,10 +25,10 @@ Declarative pipeline gates — `requires:`, `verification:`, `conditions:`, and 
 
 ## Module Map
 
-- `claude-gates-shared.js` — frontmatter parsing (`extractFrontmatter`, `parseRequires`, `parseVerification`, `parseConditions`, `parseGates`, `requiresScope`, `findAgentMd`, `VERDICT_RE`). Zero deps.
+- `claude-gates-shared.js` — frontmatter parsing (`extractFrontmatter`, `parseVerification`, `parseConditions`, `parseGates`, `requiresScope`, `findAgentMd`, `VERDICT_RE`). Zero deps.
 - `claude-gates-db.js` — SQLite session state (32 exports). Requires `better-sqlite3`. Gate operations: `initGates`, `getActiveGate`, `getReviseGate`, `getFixGate`, `passGate`, `reviseGate`, `fixGate`, `reactivateReviseGate`, `reactivateFixGate`.
 - `claude-gates-config.js` — Project-level config loader. Reads `claude-gates.json`, merges with defaults, caches per process.
-- `claude-gates-conditions.js` — PreToolUse:Agent. Checks `requires:`, `conditions:` (semantic pre-check), enforces `gates:` chain ordering, blocks missing scope for CG agents. Registers scope+cleared+pending atomically.
+- `claude-gates-conditions.js` — PreToolUse:Agent. Checks `conditions:` (semantic pre-check), enforces `gates:` chain ordering, blocks missing scope for CG agents. Registers scope+cleared+pending atomically.
 - `claude-gates-injection.js` — SubagentStart. Reads pending, injects `output_filepath`. Enhances context for gate agents (`role=gate`) and fixer agents (`role=fixer`) with source artifact info.
 - `claude-gates-verification.js` — SubagentStop. Two-layer verification (or gates-only structural check), verdict recording, gate state machine transitions. Reads `agent_transcript_path` at SubagentStop for parallel-safe scope resolution. Hardcoded gater fallback: records verdict from `last_assistant_message` when no artifact file found (feeds plan-gate). Hook stderr goes to subagent transcripts (`~/.claude/projects/.../subagents/agent-{id}.jsonl`), not terminal.
 - `plan-gate.js` — PreToolUse:ExitPlanMode. Verdict-based: checks SQLite for gater PASS/CONVERGED. Auto-allows after 3 attempts.

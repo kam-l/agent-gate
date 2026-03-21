@@ -148,7 +148,7 @@ try {
     // ── Transcript-resolved scope: move agent_id artifact to canonical path ──
     // Injection writes to {session_dir}/{agent_id}.md (unique, collision-free).
     // Here we move it to {session_dir}/{scope}/{agent_type}.md (canonical path
-    // used by requires:, gate chains, and artifact completeness checks).
+    // used by gate chains and artifact completeness checks).
     if (transcriptScope) {
       const correctPath = path.join(sessionDir, transcriptScope, `${bareAgentType}.md`);
       const scopeDir = path.dirname(correctPath);

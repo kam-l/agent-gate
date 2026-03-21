@@ -2,11 +2,10 @@
 /**
  * ClaudeGates v2 — shared module.
  *
- * Parsers for YAML frontmatter fields (requires, verification, conditions, gates).
+ * Parsers for YAML frontmatter fields (verification, conditions, gates).
  *
  * Exports:
  *   extractFrontmatter(mdContent)  → string | null
- *   parseRequires(mdContent)       → string[] | null
  *   parseVerification(mdContent)   → string | null
  *   parseConditions(mdContent)     → string | null
  *   parseGates(mdContent)          → Array<{ agent, maxRounds, fixer? }> | null
@@ -31,40 +30,6 @@ function extractFrontmatter(mdContent) {
   // Closing --- must be at column 0, followed by newline or EOF
   const match = mdContent.match(/^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
   return match ? match[1] : null;
-}
-
-/**
- * Parse requires: list from agent YAML frontmatter.
- * New schema: top-level `requires: ["implementer", "cleaner"]`
- * Returns string[] or null if not present.
- */
-function parseRequires(mdContent) {
-  const fm = extractFrontmatter(mdContent);
-  if (!fm) return null;
-
-  // New schema: requires: ["a", "b"] (inline array)
-  const inlineMatch = fm.match(/^requires:\s*\[([^\]]*)\]/m);
-  if (inlineMatch) {
-    const items = inlineMatch[1]
-      .split(",")
-      .map(s => s.trim().replace(/^["']|["']$/g, ""))
-      .filter(Boolean);
-    return items.length > 0 ? items : null;
-  }
-
-  // New schema: requires: block sequence
-  const blockMatch = fm.match(/^requires:\s*\r?\n((?:\s+-\s*.*\r?\n?)+)/m);
-  if (blockMatch) {
-    const items = [];
-    for (const line of blockMatch[1].split(/\r?\n/)) {
-      // Handle: - name, - "name", - 'name', - "name with spaces"
-      const m = line.match(/^\s+-\s*(?:"([^"]+)"|'([^']+)'|(\S+))/);
-      if (m) items.push(m[1] || m[2] || m[3]);
-    }
-    return items.length > 0 ? items : null;
-  }
-
-  return null;
 }
 
 /**
@@ -138,13 +103,13 @@ function parseGates(mdContent) {
 
 /**
  * Check whether agent definition requires a scope for gating.
- * Returns true if frontmatter contains gates: or requires:.
+ * Returns true if frontmatter contains gates: or conditions:.
  * Note: verification: alone does NOT require scope (backward compatible).
  */
 function requiresScope(mdContent) {
   const fm = extractFrontmatter(mdContent);
   if (!fm) return false;
-  return /^(gates|requires|conditions)\s*:/m.test(fm);
+  return /^(gates|conditions)\s*:/m.test(fm);
 }
 
 /**
@@ -163,4 +128,4 @@ function findAgentMd(agentType, projectRoot, home) {
   return null;
 }
 
-module.exports = { extractFrontmatter, parseRequires, parseVerification, parseConditions, parseGates, requiresScope, findAgentMd, VERDICT_RE };
+module.exports = { extractFrontmatter, parseVerification, parseConditions, parseGates, requiresScope, findAgentMd, VERDICT_RE };

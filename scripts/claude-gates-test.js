@@ -63,50 +63,6 @@ assert(
   "--- at column 0 closes frontmatter (YAML document separator)"
 );
 
-// ── parseRequires ───────────────────────────────────────────────────
-
-describe("parseRequires");
-
-assert(
-  JSON.stringify(shared.parseRequires('---\nrequires: ["implementer", "cleaner"]\n---\n')) === '["implementer","cleaner"]',
-  "inline array with double quotes"
-);
-
-assert(
-  JSON.stringify(shared.parseRequires("---\nrequires: ['a', 'b']\n---\n")) === '["a","b"]',
-  "inline array with single quotes"
-);
-
-assert(
-  JSON.stringify(shared.parseRequires('---\nrequires:\n  - implementer\n  - cleaner\n---\n')) === '["implementer","cleaner"]',
-  "block sequence unquoted"
-);
-
-assert(
-  JSON.stringify(shared.parseRequires('---\nrequires:\n  - "implementer"\n  - "cleaner"\n---\n')) === '["implementer","cleaner"]',
-  "block sequence double-quoted"
-);
-
-assert(
-  JSON.stringify(shared.parseRequires("---\nrequires:\n  - 'implementer'\n---\n")) === '["implementer"]',
-  "block sequence single-quoted"
-);
-
-assert(
-  shared.parseRequires('---\nname: foo\n---\n') === null,
-  "no requires returns null"
-);
-
-assert(
-  shared.parseRequires('---\nrequires: []\n---\n') === null,
-  "empty array returns null"
-);
-
-assert(
-  shared.parseRequires("no frontmatter") === null,
-  "no frontmatter returns null"
-);
-
 // ── parseGates ──────────────────────────────────────────────────────
 
 describe("parseGates");
@@ -150,7 +106,6 @@ assert(shared.parseConditions("no frontmatter") === null, "no frontmatter return
 
 describe("requiresScope");
 
-assert(shared.requiresScope('---\nrequires: ["a"]\n---\n') === true, "requires: needs scope");
 assert(shared.requiresScope('---\ngates:\n  - [r, 3]\n---\n') === true, "gates: needs scope");
 assert(shared.requiresScope('---\nconditions: |\n  check\n---\n') === true, "conditions: needs scope");
 assert(shared.requiresScope('---\nverification: |\n  test\n---\n') === false, "verification: alone does NOT need scope");
@@ -279,7 +234,7 @@ const tmpSession = fs.mkdtempSync(path.join(os.tmpdir(), "agentgate-session-"));
 // Create a temp agent .md with requires: ["implementer"]
 const tmpAgents = path.join(tmpSession, ".claude", "agents");
 fs.mkdirSync(tmpAgents, { recursive: true });
-fs.writeFileSync(path.join(tmpAgents, "reviewer.md"), '---\nname: reviewer\nrequires: ["implementer"]\n---\n');
+fs.writeFileSync(path.join(tmpAgents, "reviewer.md"), '---\nname: reviewer\ngates:\n  - [auditor, 2]\n---\n');
 
 const conditionsScript = path.join(__dirname, "claude-gates-conditions.js");
 
@@ -297,24 +252,6 @@ function runConditions(payload, env) {
   } catch (err) {
     return { stdout: err.stdout || "", exitCode: err.status };
   }
-}
-
-// Missing dependency → should block
-const blockResult = runConditions({
-  session_id: "test-session",
-  tool_input: {
-    subagent_type: "reviewer",
-    prompt: "scope=task-1 Review the code"
-  }
-}, { USERPROFILE: tmpSession, HOME: tmpSession });
-
-if (blockResult.stdout.trim()) {
-  const blockOutput = JSON.parse(blockResult.stdout);
-  assert(blockOutput.decision === "block", "blocks when requires dep missing");
-  assert(blockOutput.reason.includes("implementer"), "block reason mentions missing dep");
-} else {
-  assert(false, "blocks when requires dep missing (no output)");
-  assert(false, "block reason mentions missing dep (no output)");
 }
 
 // Resume → should allow (exit 0, no block output)
@@ -342,16 +279,15 @@ const noScopeNoCgResult = runConditions({
 assert(noScopeNoCgResult.exitCode === 0, "no scope + no CG fields allows (exit 0)");
 assert(!noScopeNoCgResult.stdout.includes("block"), "no scope + no CG fields produces no block");
 
-// Deps satisfied → should allow + stage pending
+// Agent with scope → should allow + stage pending
 const scopeDir = path.join(tmpSession, ".claude", "sessions", "test-session", "task-2");
 fs.mkdirSync(scopeDir, { recursive: true });
-fs.writeFileSync(path.join(scopeDir, "implementer.md"), "Result: PASS\n");
 
 const allowResult = runConditions({
   session_id: "test-session",
   tool_input: { subagent_type: "reviewer", prompt: "scope=task-2 Review it" }
 }, { USERPROFILE: tmpSession, HOME: tmpSession });
-assert(allowResult.exitCode === 0, "deps met allows (exit 0)");
+assert(allowResult.exitCode === 0, "scoped agent allows (exit 0)");
 
 // Verify pending was staged in SQLite
 const checkDb = gatesDb.getDb(path.join(tmpSession, ".claude", "sessions", "test-session"));

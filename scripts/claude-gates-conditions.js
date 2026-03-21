@@ -2,7 +2,7 @@
 /**
  * ClaudeGates v2 — PreToolUse:Agent conditions hook.
  *
- * Checks `requires:` dependencies and `gates:` chain enforcement before
+ * Checks `conditions:` and `gates:` chain enforcement before
  * allowing an agent to spawn. Extracts `scope=<name>` from the agent's prompt.
  *
  * Flow:
@@ -10,12 +10,11 @@
  *   2. No agent type? → allow
  *   3. Find agent .md → parse frontmatter
  *   4. No agent .md? → allow (no gate definition)
- *   5. Has CG fields (gates/requires/conditions) but no scope? → BLOCK
+ *   5. Has CG fields (gates/conditions) but no scope? → BLOCK
  *   6. No scope? → allow (ungated agent, backward compatible)
- *   7. Requires check: all required artifacts must exist in scope dir
- *   8. Conditions: semantic pre-check via claude -p (if conditions: field present)
- *   9. Gate enforcement: active gate → only that gate agent; revise → only source agent
- *  10. Register scope + cleared + pending
+ *   7. Conditions: semantic pre-check via claude -p (if conditions: field present)
+ *   8. Gate enforcement: active gate → only that gate agent; revise → only source agent
+ *   9. Register scope + cleared + pending
  *
  * Fail-open.
  */
@@ -23,7 +22,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { parseRequires, parseConditions, requiresScope, findAgentMd } = require("./claude-gates-shared.js");
+const { parseConditions, requiresScope, findAgentMd } = require("./claude-gates-shared.js");
 const gatesDb = require("./claude-gates-db.js");
 
 const HOME = process.env.USERPROFILE || process.env.HOME || "";
@@ -59,7 +58,7 @@ try {
     if (mdContent && requiresScope(mdContent)) {
       process.stdout.write(JSON.stringify({
         decision: "block",
-        reason: `[ClaudeGates] Agent "${agentType}" has gates/requires fields but was spawned without scope=<name>. Add scope=<name> to the prompt.`
+        reason: `[ClaudeGates] Agent "${agentType}" has gates/conditions fields but was spawned without scope=<name>. Add scope=<name> to the prompt.`
       }));
     }
     process.exit(0);
@@ -76,25 +75,6 @@ try {
   if (!sessionId) process.exit(0);
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId);
   const scopeDir = path.join(sessionDir, scope);
-
-  // Parse requires
-  const requires = parseRequires(mdContent);
-
-  // Check all required artifacts exist
-  if (requires && requires.length > 0) {
-    const missing = [];
-    for (const req of requires) {
-      const reqPath = path.join(scopeDir, `${req}.md`);
-      if (!fs.existsSync(reqPath)) missing.push(req);
-    }
-    if (missing.length > 0) {
-      process.stdout.write(JSON.stringify({
-        decision: "block",
-        reason: `[ClaudeGates] Cannot spawn ${agentType}: missing ${missing.map(m => m + ".md").join(", ")} in ${scope}/. Spawn ${missing.join(", ")} first.`
-      }));
-      process.exit(0);
-    }
-  }
 
   // ── Semantic pre-check (conditions:) ──
   const conditions = parseConditions(mdContent);
