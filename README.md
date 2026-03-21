@@ -22,6 +22,14 @@ Then I tried prompt engineering my own subagents. Wrote aggressive instructions.
 
 claude-gates moves quality control from "please do this" to "you literally cannot proceed without doing this." Every gate is a hook that fires at a deterministic moment in the agent lifecycle. No amount of prompt-following variance can bypass a `PreToolUse` block.
 
+## How It Works
+
+- **Hook-level enforcement** — gates are Claude Code hooks (`PreToolUse`, `SubagentStop`, `Stop`), not prompt instructions. They block tool calls via exit codes, not suggestions.
+- **SQLite-backed state** — all gate state (verdicts, rounds, scopes, edits) lives in a per-session `session.db` via `better-sqlite3`. Atomic transactions, no file-locking races.
+- **Scope-based isolation** — each pipeline gets a `scope=<name>`. Parallel pipelines (same session, different scopes) run independently with no cross-talk.
+- **Fail-open** — every gate catches errors and exits 0. If SQLite fails, if a script throws, if `claude -p` is unavailable — your work continues unblocked.
+- **Dependency: `better-sqlite3`** — native Node module, required. `npm install` in the plugin directory after install.
+
 ## Install
 
 ```bash
@@ -47,6 +55,8 @@ verification: |
 ```
 
 That's it. The agent's output will be judged by the gater before the pipeline continues. Spawn with `scope=<name>` so gates know which pipeline it belongs to.
+
+Run `/claude-gates:setup` to configure all gates for your project interactively.
 
 ## Gate Lifecycle
 
@@ -79,18 +89,19 @@ All gates are **fail-open** — if something breaks, your work continues unblock
 ### Agent frontmatter fields
 
 ```yaml
+# .claude/agents/implementer.md
 ---
 name: implementer
-verification: |                        # gater judges output quality after completion
+verification: |                        # SubagentStop: gater judges output against this prompt
   Does this show real implementation?
   Reply PASS or FAIL + reason.
-conditions: |                          # gater checks spawn prompt before agent runs
+conditions: |                          # PreToolUse:Agent: gater checks spawn prompt first
   Only spawn for authentication or
   data handling changes.
-gates:                                 # sequential reviewers after PASS
-  - [reviewer, 3]                      # [agent, max_rounds]
+gates:                                 # after PASS: sequential reviewers, each scoped to this pipeline
+  - [reviewer, 3]                      # [agent_name, max_rounds] — 3 REVISEs = chain fails
   - [security-auditor, 2]
-  - [reviewer, 3, fixer]              # optional 3rd element: fixer agent for REVISE
+  - [reviewer, 3, fixer]              # optional 3rd: route REVISE to fixer instead of source
 ---
 ```
 
