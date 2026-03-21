@@ -2,15 +2,16 @@
 /**
  * ClaudeGates v2 — SubagentStart injection hook.
  *
- * Injects the artifact path PATTERN into agent context. The agent derives
- * its own output_filepath from: session_dir + scope (from prompt) + agent_type.
+ * Injects output_filepath = {session_dir}/{agent_id}.md into agent context.
+ * Uses agent_id (unique per spawn) — no DB lookup needed, no parallel collision.
  *
- * This eliminates the getPending race condition for parallel pipelines:
- * each agent knows its scope from its own prompt, so no DB lookup needed
- * for path resolution. No wrong-scope writes, no file collisions.
+ * SubagentStop moves the artifact from {agent_id}.md to {scope}/{agent_type}.md
+ * using the definitive scope from agent_transcript_path. This two-phase approach
+ * eliminates the getPending race for parallel same-type agents:
+ *   - Injection: write to unique temp path (agent_id) — collision-free
+ *   - Verification: move to canonical path (scope/type) — transcript-authoritative
  *
- * Gate context (role, source_agent, source_artifact) is best-effort
- * enrichment via DB lookup — helpful but not required for correctness.
+ * Gate context (role, source_agent) is best-effort enrichment via DB.
  *
  * Fail-open.
  */
@@ -25,14 +26,20 @@ try {
 
   const sessionId = data.session_id || "";
   const agentType = data.agent_type || "";
+  const agentId = data.agent_id || "";
 
   if (!sessionId || !agentType) process.exit(0);
 
   const bareAgentType = agentType.includes(":") ? agentType.split(":").pop() : agentType;
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId).replace(/\\/g, "/");
 
-  // Best-effort gate context enrichment via DB.
-  // Not required for path correctness — agent derives its own path.
+  // Output path uses agent_id — unique per spawn, no collision possible.
+  // SubagentStop moves this to {scope}/{agent_type}.md after resolving scope from transcript.
+  const outputFilepath = agentId
+    ? `${sessionDir}/${agentId}.md`
+    : `${sessionDir}/${bareAgentType}.md`;
+
+  // Best-effort gate context enrichment via DB
   let gateContext = "";
   const db = getDb(sessionDir);
   try {
@@ -41,9 +48,7 @@ try {
       const scope = pending.scope;
       const activeGate = getActiveGate(db, scope);
       if (activeGate && activeGate.gate_agent === bareAgentType) {
-        const sourceArtifact = path.join(
-          sessionDir, scope, `${activeGate.source_agent}.md`
-        ).replace(/\\/g, "/");
+        const sourceArtifact = `${sessionDir}/${scope}/${activeGate.source_agent}.md`;
         gateContext =
           `role=gate\n` +
           `source_agent=${activeGate.source_agent}\n` +
@@ -52,9 +57,7 @@ try {
       }
       const fixGateRow = getFixGate(db, scope);
       if (fixGateRow && fixGateRow.fixer_agent === bareAgentType) {
-        const sourceArtifact = path.join(
-          sessionDir, scope, `${fixGateRow.source_agent}.md`
-        ).replace(/\\/g, "/");
+        const sourceArtifact = `${sessionDir}/${scope}/${fixGateRow.source_agent}.md`;
         gateContext =
           `role=fixer\n` +
           `source_agent=${fixGateRow.source_agent}\n` +
@@ -67,17 +70,11 @@ try {
     db.close();
   }
 
-  // Inject pattern — agent derives output_filepath from its own scope= and type.
-  // No explicit path = no wrong-scope writes = no parallel collision.
   const context =
     `<agent_gate importance="critical">\n` +
-    `session_dir=${sessionDir}\n` +
+    `output_filepath=${outputFilepath}\n` +
     gateContext +
-    `Write your artifact to: {session_dir}/{scope}/{agent_type}.md\n` +
-    `  - scope: extract from your prompt (scope=<name>)\n` +
-    `  - agent_type: your agent name\n` +
-    `  - Create the directory if needed\n` +
-    `Last line must be: Result: PASS or Result: FAIL\n` +
+    `Write your artifact to this exact path. Last line must be: Result: PASS or Result: FAIL\n` +
     `</agent_gate>`;
 
   process.stdout.write(JSON.stringify({

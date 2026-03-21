@@ -409,14 +409,13 @@ const injResult = runInjection({
 if (injResult.stdout.trim()) {
   const injOutput = JSON.parse(injResult.stdout);
   const ctx = injOutput.hookSpecificOutput && injOutput.hookSpecificOutput.additionalContext;
-  assert(ctx && ctx.includes("session_dir="), "injects session_dir");
+  assert(ctx && ctx.includes("output_filepath="), "injects output_filepath");
+  assert(ctx && ctx.includes("test-reviewer-1.md"), "output_filepath uses agent_id");
   assert(ctx && ctx.includes('<agent_gate importance="critical">'), "wraps in <agent_gate importance=\"critical\">");
-  assert(ctx && ctx.includes("{session_dir}/{scope}/{agent_type}.md"), "includes path pattern");
   assert(ctx && ctx.includes("Result: PASS or Result: FAIL"), "includes Result: format instruction");
 } else {
-  assert(false, "injects session_dir (no output)");
+  assert(false, "injects output_filepath (no output)");
   assert(false, 'wraps in <agent_gate importance="critical"> (no output)');
-  assert(false, "includes path pattern (no output)");
   assert(false, "includes Result: format instruction (no output)");
 }
 
@@ -436,11 +435,12 @@ const ungatedResult = runInjection({
 if (ungatedResult.stdout.trim()) {
   const ungatedOutput = JSON.parse(ungatedResult.stdout);
   const ungatedCtx = ungatedOutput.hookSpecificOutput && ungatedOutput.hookSpecificOutput.additionalContext;
-  assert(ungatedCtx && ungatedCtx.includes("session_dir="), "ungated agent gets session_dir");
-  assert(ungatedCtx && ungatedCtx.includes('importance="critical"'), "ungated agent gets <agent_gate importance=critical>");
+  // All agents now get importance="critical" with output_filepath (agent_id or fallback)
+  assert(ungatedCtx && ungatedCtx.includes("output_filepath="), "ungated agent gets output_filepath");
+  assert(ungatedCtx && ungatedCtx.includes('importance="critical"'), "ungated agent gets critical agent_gate");
 } else {
-  assert(false, "ungated agent gets session_dir (no output)");
-  assert(false, "ungated agent gets <agent_gate importance=critical> (no output)");
+  assert(false, "ungated agent gets output_filepath (no output)");
+  assert(false, "ungated agent gets critical agent_gate (no output)");
 }
 
 // ── Transcript-based scope resolution (parallel-safe) ──
@@ -488,16 +488,18 @@ if (ungatedResult.stdout.trim()) {
   if (resultA.stdout.trim() && resultB.stdout.trim()) {
     const ctxA = JSON.parse(resultA.stdout).hookSpecificOutput.additionalContext;
     const ctxB = JSON.parse(resultB.stdout).hookSpecificOutput.additionalContext;
-    // Injection gives pattern, not explicit path — both get same session_dir + pattern
-    assert(ctxA.includes("session_dir="), "parallel: agent-a gets session_dir");
-    assert(ctxB.includes("session_dir="), "parallel: agent-b gets session_dir");
-    assert(ctxA.includes("{session_dir}/{scope}/{agent_type}.md"), "parallel: agent-a gets path pattern");
-    assert(ctxB.includes("{session_dir}/{scope}/{agent_type}.md"), "parallel: agent-b gets path pattern");
+    // Both get output_filepath via getPending (may be same scope — parallel race)
+    // SubagentStop corrects via transcript. Here we just check injection works.
+    assert(ctxA.includes("output_filepath="), "parallel: agent-a gets output_filepath");
+    assert(ctxB.includes("output_filepath="), "parallel: agent-b gets output_filepath");
+    // Path uses agent_id (unique per spawn), not agent_type
+    assert(ctxA.includes("worker-a.md"), "parallel: agent-a path uses agent_id");
+    assert(ctxB.includes("worker-b.md"), "parallel: agent-b path uses agent_id");
   } else {
-    assert(false, "parallel: agent-a gets session_dir (no output)");
-    assert(false, "parallel: agent-b gets session_dir (no output)");
-    assert(false, "parallel: agent-a gets path pattern (no output)");
-    assert(false, "parallel: agent-b gets path pattern (no output)");
+    assert(false, "parallel: agent-a gets output_filepath (no output)");
+    assert(false, "parallel: agent-b gets output_filepath (no output)");
+    assert(false, "parallel: agent-a path uses agent_id (no output)");
+    assert(false, "parallel: agent-b path uses agent_id (no output)");
   }
 
   // Test: no transcript_path → falls back to getPending (DB lookup)
@@ -507,9 +509,9 @@ if (ungatedResult.stdout.trim()) {
   }, { USERPROFILE: tmpParallel, HOME: tmpParallel });
   if (noTranscript.stdout.trim()) {
     const noCtx = JSON.parse(noTranscript.stdout).hookSpecificOutput.additionalContext;
-    // All agents get session_dir + pattern (no explicit output_filepath)
-    assert(noCtx.includes("session_dir="),
-      "no transcript → gets session_dir + pattern");
+    // getPending finds a registered gt-worker → injects output_filepath
+    assert(noCtx.includes("output_filepath=") || noCtx.includes("session_dir="),
+      "no transcript → getPending or ungated");
   } else {
     assert(false, "no transcript → produces output");
   }
@@ -526,8 +528,9 @@ if (ungatedResult.stdout.trim()) {
   }, { USERPROFILE: tmpParallel, HOME: tmpParallel });
   if (noScopeResult.stdout.trim()) {
     const nsCtx = JSON.parse(noScopeResult.stdout).hookSpecificOutput.additionalContext;
-    assert(nsCtx.includes("session_dir=") && !nsCtx.includes("output_filepath="),
-      "no scope + unknown agent → ungated");
+    // All agents now get output_filepath (agent_id-based path)
+    assert(nsCtx.includes("output_filepath="),
+      "no scope + unknown agent → still gets output_filepath");
   } else {
     assert(false, "no scope + unknown agent → produces output");
   }

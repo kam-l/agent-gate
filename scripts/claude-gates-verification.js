@@ -145,14 +145,29 @@ try {
   const db = gatesDb.getDb(sessionDir);
 
   try {
-    // ── Transcript-resolved scope: check artifact at correct path ──
-    // Agent derives its own path from scope= in prompt + session_dir.
-    // No file moves — if artifact is at wrong path, block until agent fixes it.
+    // ── Transcript-resolved scope: move agent_id artifact to canonical path ──
+    // Injection writes to {session_dir}/{agent_id}.md (unique, collision-free).
+    // Here we move it to {session_dir}/{scope}/{agent_type}.md (canonical path
+    // used by requires:, gate chains, and artifact completeness checks).
     if (transcriptScope) {
       const correctPath = path.join(sessionDir, transcriptScope, `${bareAgentType}.md`);
+      const scopeDir = path.dirname(correctPath);
+
+      // If artifact already at canonical path (re-run or manual write), use it directly
+      if (!fs.existsSync(correctPath)) {
+        // Move from agent_id temp path to canonical scope path
+        const tempPath = path.join(sessionDir, `${agentId}.md`);
+        if (fs.existsSync(tempPath)) {
+          if (!fs.existsSync(scopeDir)) fs.mkdirSync(scopeDir, { recursive: true });
+          try {
+            fs.copyFileSync(tempPath, correctPath);
+            fs.unlinkSync(tempPath);
+          } catch {} // if move fails, fall through to block
+        }
+      }
 
       if (fs.existsSync(correctPath)) {
-        // Artifact at correct path → proceed with verification
+        // Artifact at canonical path → proceed with verification
         if (verification) {
           runVerification(correctPath, transcriptScope, verification, sessionDir, agentType, agentId, mdContent, db);
         } else {
@@ -161,9 +176,7 @@ try {
         process.exit(0);
       }
 
-      // Artifact missing — block. Agent has session_dir + scope= + agent_type,
-      // so it can derive the correct path and write there.
-      const scopeDir = path.join(sessionDir, transcriptScope);
+      // Artifact missing — block until agent writes it
       if (!fs.existsSync(scopeDir)) fs.mkdirSync(scopeDir, { recursive: true });
       block(`Write your artifact to ${sessionDir.replace(/\\/g, "/")}/${transcriptScope}/${bareAgentType}.md before stopping. Include a Result: PASS or Result: FAIL line.`);
       process.exit(0);
