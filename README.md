@@ -27,6 +27,7 @@ claude-gates moves quality control from "please do this" to "you literally canno
 - **Hook-level enforcement** — gates are Claude Code hooks (`PreToolUse`, `SubagentStop`, `Stop`), not prompt instructions. They block tool calls via exit codes, not suggestions.
 - **SQLite-backed state** — all gate state (verdicts, rounds, scopes, edits) lives in a per-session `session.db` via `better-sqlite3`. Atomic transactions, no file-locking races.
 - **Scope-based isolation** — each pipeline gets a `scope=<name>`. Parallel pipelines (same session, different scopes) run independently with no cross-talk.
+- **Artifact-based** — each agent gets an `output_filepath` injected at spawn. Gates verify the artifact file, not conversation state. Artifacts persist on disk, survive compaction, and are readable by downstream agents.
 - **Fail-open** — every gate catches errors and exits 0. If SQLite fails, if a script throws, if `claude -p` is unavailable — your work continues unblocked.
 - **Dependency: `better-sqlite3`** — native Node module, required. `npm install` in the plugin directory after install.
 
@@ -35,10 +36,9 @@ claude-gates moves quality control from "please do this" to "you literally canno
 ```bash
 claude plugin marketplace add kam-l/claude-gates
 claude plugin install claude-gates
-cd ~/.claude/plugins/cache/claude-gates && npm install
 ```
 
-Then run `/claude-gates:setup` to configure gates for your project.
+Then run `/claude-gates:setup` — it checks dependencies, detects your stack, and configures gates interactively.
 
 ## Quick Start
 
@@ -109,30 +109,7 @@ Spawn agents with `scope=<name>` so gates know which pipeline they belong to.
 
 ## Configuration
 
-All gates are configured via optional `claude-gates.json` at your repo root. Run `/claude-gates:setup` to generate one interactively.
-
-Missing fields use defaults. No config file = built-in defaults. All gates work without any configuration.
-
-```json
-{
-  "stop_gate": {
-    "patterns": ["TODO", "HACK", "FIXME", "console.log"],
-    "commands": [],
-    "mode": "warn"
-  },
-  "commit_gate": {
-    "commands": [],
-    "enabled": false
-  },
-  "edit_gate": {
-    "commands": []
-  }
-}
-```
-
-## Agents
-
-**Gater** (`claude-gates:gater`) — the universal quality gate agent. Handles artifact review, conditions pre-checks, and plan verification. Read-only evaluator with tools restricted to Read, Grep, Glob, and read-only Bash. Returns `Result: PASS`, `REVISE`, `CONVERGED`, or `FAIL`.
+`/claude-gates:setup` is the one-stop for installation, explanation, and customization. It teaches each gate interactively and writes `claude-gates.json` for you. Run it again anytime to learn about a gate, change settings, or add agents.
 
 ## Testing
 
