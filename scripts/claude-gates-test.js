@@ -351,28 +351,11 @@ const allowResult = runConditions({
 }, { USERPROFILE: tmpSession, HOME: tmpSession });
 assert(allowResult.exitCode === 0, "deps met allows (exit 0)");
 
-// Verify pending was staged (check DB if SQLite available, else JSON)
-const scopesFile = path.join(tmpSession, ".claude", "sessions", "test-session", "session_scopes.json");
-const dbFile = path.join(tmpSession, ".claude", "sessions", "test-session", "session.db");
-if (fs.existsSync(dbFile)) {
-  // SQLite path — check DB for pending
-  const checkDb = gatesDb.getDb(path.join(tmpSession, ".claude", "sessions", "test-session"));
-  if (checkDb) {
-    const checkPend = gatesDb.getPending(checkDb, "reviewer");
-    assert(checkPend && checkPend.outputFilepath, "pending staged with outputFilepath (DB)");
-    checkDb.close();
-  } else {
-    assert(false, "pending staged with outputFilepath (DB open failed)");
-  }
-} else if (fs.existsSync(scopesFile)) {
-  const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
-  assert(
-    scopes._pending && scopes._pending.reviewer && scopes._pending.reviewer.outputFilepath,
-    "pending staged with outputFilepath"
-  );
-} else {
-  assert(false, "pending staged with outputFilepath (no state file found)");
-}
+// Verify pending was staged in SQLite
+const checkDb = gatesDb.getDb(path.join(tmpSession, ".claude", "sessions", "test-session"));
+const checkPend = gatesDb.getPending(checkDb, "reviewer");
+assert(checkPend && checkPend.outputFilepath, "pending staged with outputFilepath (DB)");
+checkDb.close();
 
 // Reserved scope name _pending → should be treated as ungated (allow, no gating)
 const pendingResult = runConditions({
@@ -502,25 +485,14 @@ try {
   });
 } catch {} // ignore exit code
 
-const reSpawnDbFile = path.join(reSpawnSessionDir, "session.db");
-if (fs.existsSync(reSpawnDbFile)) {
-  // SQLite path — check DB (JSON was migrated, DB has the state)
-  const rsDb = gatesDb.getDb(reSpawnSessionDir);
-  const rsAgent = gatesDb.getAgent(rsDb, "task-x", "worker");
-  assert(
-    rsAgent && rsAgent.verdict === "REVISE",
-    "existing verdict object not overwritten to true on re-spawn (DB)"
-  );
-  rsDb.close();
-} else {
-  const reSpawnScopes = JSON.parse(fs.readFileSync(reSpawnScopesFile, "utf-8"));
-  assert(
-    reSpawnScopes["task-x"].cleared.worker &&
-    typeof reSpawnScopes["task-x"].cleared.worker === "object" &&
-    reSpawnScopes["task-x"].cleared.worker.verdict === "REVISE",
-    "existing verdict object not overwritten to true on re-spawn"
-  );
-}
+// SQLite path — check DB (JSON was migrated, DB has the state)
+const rsDb = gatesDb.getDb(reSpawnSessionDir);
+const rsAgent = gatesDb.getAgent(rsDb, "task-x", "worker");
+assert(
+  rsAgent && rsAgent.verdict === "REVISE",
+  "existing verdict object not overwritten to true on re-spawn (DB)"
+);
+rsDb.close();
 
 fs.rmSync(tmpReSpawn, { recursive: true, force: true });
 
@@ -554,41 +526,22 @@ runEditGate({
   tool_input: { file_path: "/tmp/test-file.js" }
 }, { USERPROFILE: tmpEditSession, HOME: tmpEditSession });
 
-const editLogPath = path.join(editSessionDir, "edits.log");
-const editDbPath = path.join(editSessionDir, "session.db");
-const editUsesDb = fs.existsSync(editDbPath);
-if (editUsesDb) {
-  assert(true, "edit-gate creates session.db");
-  const edb = gatesDb.getDb(editSessionDir);
-  const eEdits = gatesDb.getEdits(edb);
-  assert(eEdits.length > 0, "session.db contains file path");
+assert(fs.existsSync(path.join(editSessionDir, "session.db")), "edit-gate creates session.db");
+const edb = gatesDb.getDb(editSessionDir);
+const eEdits = gatesDb.getEdits(edb);
+assert(eEdits.length > 0, "session.db contains file path");
 
-  // Test: dedup — same file again should not duplicate
-  runEditGate({
-    session_id: "edit-test",
-    tool_input: { file_path: "/tmp/test-file.js" }
-  }, { USERPROFILE: tmpEditSession, HOME: tmpEditSession });
+// Test: dedup — same file again should not duplicate
+runEditGate({
+  session_id: "edit-test",
+  tool_input: { file_path: "/tmp/test-file.js" }
+}, { USERPROFILE: tmpEditSession, HOME: tmpEditSession });
 
-  const eEdits2 = gatesDb.getEdits(edb);
-  const normalizedPath = path.resolve("/tmp/test-file.js").replace(/\\/g, "/");
-  const eCount = eEdits2.filter(e => e === normalizedPath).length;
-  assert(eCount === 1, "edit-gate deduplicates entries (DB)");
-  edb.close();
-} else {
-  assert(fs.existsSync(editLogPath), "edit-gate creates edits.log");
-
-  const editLogContent = fs.readFileSync(editLogPath, "utf-8").trim();
-  assert(editLogContent.length > 0, "edits.log contains file path");
-
-  // Test: dedup — same file again should not duplicate
-  runEditGate({
-    session_id: "edit-test",
-    tool_input: { file_path: "/tmp/test-file.js" }
-  }, { USERPROFILE: tmpEditSession, HOME: tmpEditSession });
-
-  const editLogLines = fs.readFileSync(editLogPath, "utf-8").trim().split("\n").filter(Boolean);
-  assert(editLogLines.length === 1, "edit-gate deduplicates entries");
-}
+const eEdits2 = gatesDb.getEdits(edb);
+const normalizedPath = path.resolve("/tmp/test-file.js").replace(/\\/g, "/");
+const eCount = eEdits2.filter(e => e === normalizedPath).length;
+assert(eCount === 1, "edit-gate deduplicates entries (DB)");
+edb.close();
 
 // Test: missing session_id → exit 0
 const noSessionEdit = runEditGate({ tool_input: { file_path: "/tmp/x.js" } }, { USERPROFILE: tmpEditSession, HOME: tmpEditSession });
@@ -624,10 +577,12 @@ fs.mkdirSync(stopSessionDir, { recursive: true });
 const cleanResult = runStopGate({ session_id: "stop-test" }, { USERPROFILE: tmpStopSession, HOME: tmpStopSession });
 assert(cleanResult.exitCode === 0 && !cleanResult.stdout.includes("block"), "clean session passes stop-gate");
 
-// Create a file with TODO and register it in edits.log
+// Create a file with TODO and register it in SQLite
 const dirtyFile = path.join(tmpStopSession, "dirty.js");
 fs.writeFileSync(dirtyFile, "// TODO: remove this\nconsole.log('debug');\n", "utf-8");
-fs.writeFileSync(path.join(stopSessionDir, "edits.log"), dirtyFile.replace(/\\/g, "/") + "\n", "utf-8");
+const stopDb = gatesDb.getDb(stopSessionDir);
+gatesDb.addEdit(stopDb, dirtyFile.replace(/\\/g, "/"));
+stopDb.close();
 
 // Test: dirty files in default warn mode → no block (stderr only)
 const dirtyWarnResult = runStopGate({ session_id: "stop-test" }, { USERPROFILE: tmpStopSession, HOME: tmpStopSession });
@@ -643,7 +598,9 @@ const nudgeSessionDir = path.join(tmpNudgeSession, ".claude", "sessions", "stop-
 fs.mkdirSync(nudgeSessionDir, { recursive: true });
 const nudgeDirty = path.join(tmpNudgeSession, "dirty.js");
 fs.writeFileSync(nudgeDirty, "// TODO: fix\n", "utf-8");
-fs.writeFileSync(path.join(nudgeSessionDir, "edits.log"), nudgeDirty.replace(/\\/g, "/") + "\n", "utf-8");
+const nudgeDb = gatesDb.getDb(nudgeSessionDir);
+gatesDb.addEdit(nudgeDb, nudgeDirty.replace(/\\/g, "/"));
+nudgeDb.close();
 
 const dirtyResult = runStopGate(
   { session_id: "stop-nudge" },
@@ -670,7 +627,9 @@ try { fs.unlinkSync(nudgeConfig); } catch {}
 const deletedStopSession = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stop2-"));
 const deletedSessionDir = path.join(deletedStopSession, ".claude", "sessions", "stop-del");
 fs.mkdirSync(deletedSessionDir, { recursive: true });
-fs.writeFileSync(path.join(deletedSessionDir, "edits.log"), "/nonexistent/deleted-file.js\n", "utf-8");
+const delDb = gatesDb.getDb(deletedSessionDir);
+gatesDb.addEdit(delDb, "/nonexistent/deleted-file.js");
+delDb.close();
 
 const deletedResult = runStopGate({ session_id: "stop-del" }, { USERPROFILE: deletedStopSession, HOME: deletedStopSession });
 assert(deletedResult.exitCode === 0 && !deletedResult.stdout.includes("block"), "deleted files are skipped");
@@ -790,7 +749,7 @@ describe("SQLite DB: getDb creates session.db with 4 tables");
 const tmpDbSession = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-db-"));
 const db = gatesDb.getDb(tmpDbSession);
 
-if (db) {
+{
   const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(r => r.name);
   assert(tables.includes("agents"), "agents table exists");
   assert(tables.includes("gates"), "gates table exists");
@@ -935,22 +894,18 @@ if (db) {
   fs.writeFileSync(path.join(tmpMigrate, ".stop-gate-nudged"), "2026-01-01T00:00:00Z", "utf-8");
 
   const mdb = gatesDb.getDb(tmpMigrate);
-  if (mdb) {
-    assert(gatesDb.isCleared(mdb, "scope-a", "implementer"), "migrated: implementer cleared");
-    const revAgent = gatesDb.getAgent(mdb, "scope-a", "reviewer");
-    assert(revAgent && revAgent.verdict === "PASS" && revAgent.round === 2, "migrated: reviewer verdict object");
-    const mPend = gatesDb.getPending(mdb, "reviewer");
-    assert(mPend && mPend.outputFilepath === "/tmp/reviewer.md", "migrated: pending entry");
-    const mEdits = gatesDb.getEdits(mdb);
-    assert(mEdits.length === 2, "migrated: 2 edit entries");
-    const mHashes = gatesDb.getLastNHashes(mdb, 10);
-    assert(mHashes.length === 3, "migrated: 3 tool history entries");
-    assert(gatesDb.isCleared(mdb, "_nudge", "stop-gate"), "migrated: stop-gate-nudged marker");
-    assert(gatesDb.isCleared(mdb, "_meta", "json_migrated"), "migration marker set");
-    mdb.close();
-  } else {
-    assert(false, "migration test skipped — better-sqlite3 not available");
-  }
+  assert(gatesDb.isCleared(mdb, "scope-a", "implementer"), "migrated: implementer cleared");
+  const revAgent = gatesDb.getAgent(mdb, "scope-a", "reviewer");
+  assert(revAgent && revAgent.verdict === "PASS" && revAgent.round === 2, "migrated: reviewer verdict object");
+  const mPend = gatesDb.getPending(mdb, "reviewer");
+  assert(mPend && mPend.outputFilepath === "/tmp/reviewer.md", "migrated: pending entry");
+  const mEdits = gatesDb.getEdits(mdb);
+  assert(mEdits.length === 2, "migrated: 2 edit entries");
+  const mHashes = gatesDb.getLastNHashes(mdb, 10);
+  assert(mHashes.length === 3, "migrated: 3 tool history entries");
+  assert(gatesDb.isCleared(mdb, "_nudge", "stop-gate"), "migrated: stop-gate-nudged marker");
+  assert(gatesDb.isCleared(mdb, "_meta", "json_migrated"), "migration marker set");
+  mdb.close();
   fs.rmSync(tmpMigrate, { recursive: true, force: true });
 
   // ── Migration: partial state ──
@@ -963,15 +918,11 @@ if (db) {
   }, null, 2), "utf-8");
 
   const pdb = gatesDb.getDb(tmpPartial);
-  if (pdb) {
-    assert(gatesDb.isCleared(pdb, "only-scope", "worker"), "partial migration: scope migrated");
-    assert(gatesDb.getEdits(pdb).length === 0, "partial migration: no edits (file absent)");
-    assert(gatesDb.getLastNHashes(pdb, 10).length === 0, "partial migration: no history (file absent)");
-    assert(gatesDb.isCleared(pdb, "_meta", "json_migrated"), "partial migration marker set");
-    pdb.close();
-  } else {
-    assert(false, "partial migration test skipped — better-sqlite3 not available");
-  }
+  assert(gatesDb.isCleared(pdb, "only-scope", "worker"), "partial migration: scope migrated");
+  assert(gatesDb.getEdits(pdb).length === 0, "partial migration: no edits (file absent)");
+  assert(gatesDb.getLastNHashes(pdb, 10).length === 0, "partial migration: no history (file absent)");
+  assert(gatesDb.isCleared(pdb, "_meta", "json_migrated"), "partial migration marker set");
+  pdb.close();
   fs.rmSync(tmpPartial, { recursive: true, force: true });
 
   // ── Migration: fresh session (no old files) ──
@@ -979,13 +930,9 @@ if (db) {
 
   const tmpFresh = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-migrate-fresh-"));
   const fdb = gatesDb.getDb(tmpFresh);
-  if (fdb) {
-    assert(!gatesDb.isCleared(fdb, "_meta", "json_migrated"), "fresh session: no migration marker");
-    assert(gatesDb.getEdits(fdb).length === 0, "fresh session: empty edits");
-    fdb.close();
-  } else {
-    assert(false, "fresh session test skipped — better-sqlite3 not available");
-  }
+  assert(!gatesDb.isCleared(fdb, "_meta", "json_migrated"), "fresh session: no migration marker");
+  assert(gatesDb.getEdits(fdb).length === 0, "fresh session: empty edits");
+  fdb.close();
   fs.rmSync(tmpFresh, { recursive: true, force: true });
 
   // ── fixer_agent column migration test ──
@@ -1041,13 +988,9 @@ if (db) {
 
     // Verify both hashes appear in DB
     const cdb = gatesDb.getDb(concSessionDir);
-    if (cdb) {
-      const cHashes = gatesDb.getLastNHashes(cdb, 10);
-      assert(cHashes.length === 2, "concurrent writes: both hashes recorded");
-      cdb.close();
-    } else {
-      assert(false, "concurrent writes test skipped — better-sqlite3 not available");
-    }
+    const cHashes = gatesDb.getLastNHashes(cdb, 10);
+    assert(cHashes.length === 2, "concurrent writes: both hashes recorded");
+    cdb.close();
   } catch (err) {
     assert(false, `concurrent writes: ${err.message}`);
   }
@@ -1088,20 +1031,9 @@ if (db) {
 
   fs.rmSync(tmpDbCond, { recursive: true, force: true });
 
-} else {
-  // better-sqlite3 not installed — skip SQLite tests
-  console.log("  SKIP: better-sqlite3 not installed — SQLite tests skipped (JSON fallback verified by existing tests)");
 }
 
 fs.rmSync(tmpDbSession, { recursive: true, force: true });
-
-// ── Fallback test: JSON path when DB unavailable ──
-describe("SQLite DB: fallback — JSON path works without DB");
-
-// This is already verified by all existing integration tests above.
-// They run subprocess hooks which may or may not have better-sqlite3.
-// The existing tests all pass → JSON path works.
-assert(true, "JSON fallback verified by existing integration tests");
 
 // ── hooks.json wiring: plan-gate, commit-gate, SubagentStop ──────────
 
@@ -1207,16 +1139,10 @@ fs.writeFileSync(path.join(planVerdictPlans, "big.md"), bigPlan, "utf-8");
 const planVerdictSession = path.join(planVerdictHome, ".claude", "sessions", "plan-verdict-test");
 fs.mkdirSync(planVerdictSession, { recursive: true });
 
-// Seed gater verdict via DB or JSON
+// Seed gater verdict
 const pvDb = gatesDb.getDb(planVerdictSession);
-if (pvDb) {
-  gatesDb.setVerdict(pvDb, "verify-plan", "gater", "PASS", 1);
-  pvDb.close();
-} else {
-  fs.writeFileSync(path.join(planVerdictSession, "session_scopes.json"), JSON.stringify({
-    "verify-plan": { cleared: { gater: { verdict: "PASS", round: 1 } } }
-  }, null, 2), "utf-8");
-}
+gatesDb.setVerdict(pvDb, "verify-plan", "gater", "PASS", 1);
+pvDb.close();
 
 const verdictResult = runPlanGate(
   { session_id: "plan-verdict-test" },
@@ -1228,14 +1154,8 @@ assert(verdictResult.exitCode === 0 && !verdictResult.stdout.includes("block"), 
 const planConvSession = path.join(planVerdictHome, ".claude", "sessions", "plan-conv-test");
 fs.mkdirSync(planConvSession, { recursive: true });
 const pcDb = gatesDb.getDb(planConvSession);
-if (pcDb) {
-  gatesDb.setVerdict(pcDb, "verify-plan", "gater", "CONVERGED", 1);
-  pcDb.close();
-} else {
-  fs.writeFileSync(path.join(planConvSession, "session_scopes.json"), JSON.stringify({
-    "verify-plan": { cleared: { gater: { verdict: "CONVERGED", round: 1 } } }
-  }, null, 2), "utf-8");
-}
+gatesDb.setVerdict(pcDb, "verify-plan", "gater", "CONVERGED", 1);
+pcDb.close();
 
 const convResult = runPlanGate(
   { session_id: "plan-conv-test" },
@@ -1247,14 +1167,8 @@ assert(convResult.exitCode === 0 && !convResult.stdout.includes("block"), "gater
 const planFailSession = path.join(planVerdictHome, ".claude", "sessions", "plan-fail-test");
 fs.mkdirSync(planFailSession, { recursive: true });
 const pfDb = gatesDb.getDb(planFailSession);
-if (pfDb) {
-  gatesDb.setVerdict(pfDb, "verify-plan", "gater", "FAIL", 1);
-  pfDb.close();
-} else {
-  fs.writeFileSync(path.join(planFailSession, "session_scopes.json"), JSON.stringify({
-    "verify-plan": { cleared: { gater: { verdict: "FAIL", round: 1 } } }
-  }, null, 2), "utf-8");
-}
+gatesDb.setVerdict(pfDb, "verify-plan", "gater", "FAIL", 1);
+pfDb.close();
 
 const failResult = runPlanGate(
   { session_id: "plan-fail-test" },
@@ -1305,6 +1219,123 @@ if (mixBlockResult.stdout.trim()) {
 }
 
 fs.rmSync(agentPlanHome, { recursive: true, force: true });
+
+// ── plan-gate: adversary verdict alone does NOT satisfy ──────────────
+
+describe("plan-gate: adversary verdict alone blocks (only gater counts)");
+
+const tmpAdvHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-plan-adv-"));
+const advPlanDir = path.join(tmpAdvHome, ".claude", "plans");
+fs.mkdirSync(advPlanDir, { recursive: true });
+fs.writeFileSync(path.join(advPlanDir, "adv-plan.md"), bigPlan, "utf-8");
+const advSession = path.join(tmpAdvHome, ".claude", "sessions", "plan-adv-test");
+fs.mkdirSync(advSession, { recursive: true });
+
+const advDb = gatesDb.getDb(advSession);
+gatesDb.setVerdict(advDb, "verify-plan", "adversary", "PASS", 1);
+advDb.close();
+
+const advResult = runPlanGate(
+  { session_id: "plan-adv-test" },
+  { USERPROFILE: tmpAdvHome, HOME: tmpAdvHome }
+);
+assert(advResult.stdout.includes("block"), "adversary PASS alone does not satisfy plan-gate");
+
+fs.rmSync(tmpAdvHome, { recursive: true, force: true });
+
+// ── plan-gate-clear: clears gater verdict ────────────────────────────
+
+describe("plan-gate-clear: PostToolUse:ExitPlanMode clears gater verdict");
+
+const planGateClearScript = path.join(__dirname, "plan-gate-clear.js");
+
+function runPlanGateClear(payload, env) {
+  try {
+    const result = execSync(`node "${planGateClearScript}"`, {
+      input: JSON.stringify(payload),
+      encoding: "utf-8",
+      timeout: 5000,
+      env: { ...process.env, ...env }
+    });
+    return { stdout: result, exitCode: 0 };
+  } catch (err) {
+    return { stdout: err.stdout || "", exitCode: err.status };
+  }
+}
+
+// Test: gater verdict → allows, then plan-gate-clear wipes it → next ExitPlanMode blocks
+const tmpClearHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-plan-clear-"));
+const clearPlanDir = path.join(tmpClearHome, ".claude", "plans");
+fs.mkdirSync(clearPlanDir, { recursive: true });
+fs.writeFileSync(path.join(clearPlanDir, "big.md"), bigPlan, "utf-8");
+const clearSession = path.join(tmpClearHome, ".claude", "sessions", "plan-clear-test");
+fs.mkdirSync(clearSession, { recursive: true });
+
+const clDb = gatesDb.getDb(clearSession);
+gatesDb.setVerdict(clDb, "verify-plan", "gater", "PASS", 1);
+clDb.close();
+
+// Step 1: plan-gate should allow (gater PASS present)
+const clearAllow = runPlanGate(
+  { session_id: "plan-clear-test" },
+  { USERPROFILE: tmpClearHome, HOME: tmpClearHome }
+);
+assert(!clearAllow.stdout.includes("block"), "plan-gate allows with gater verdict before clear");
+
+// Step 2: run plan-gate-clear (simulates PostToolUse:ExitPlanMode)
+const clearResult = runPlanGateClear(
+  { session_id: "plan-clear-test" },
+  { USERPROFILE: tmpClearHome, HOME: tmpClearHome }
+);
+assert(clearResult.exitCode === 0, "plan-gate-clear exits 0");
+
+// Step 3: plan-gate should now block (verdict cleared)
+const clearBlock = runPlanGate(
+  { session_id: "plan-clear-test" },
+  { USERPROFILE: tmpClearHome, HOME: tmpClearHome }
+);
+assert(clearBlock.stdout.includes("block"), "plan-gate blocks after clear wipes gater verdict");
+
+fs.rmSync(tmpClearHome, { recursive: true, force: true });
+
+// ── plan-gate-clear wired in hooks.json ──────────────────────────────
+
+describe("plan-gate-clear wired in hooks.json");
+
+const hooksJsonClear = JSON.parse(
+  fs.readFileSync(path.join(PLUGIN_ROOT, "hooks", "hooks.json"), "utf-8")
+);
+const postToolUseClear = hooksJsonClear.hooks.PostToolUse || [];
+const clearHook = postToolUseClear.find(h => h.matcher === "ExitPlanMode");
+assert(!!clearHook, "PostToolUse:ExitPlanMode hook registered");
+assert(
+  clearHook && clearHook.hooks[0].command.includes("plan-gate-clear"),
+  "plan-gate-clear hook wired"
+);
+
+// ── plan-gate block message mentions gater agent ─────────────────────
+
+describe("plan-gate block message mentions gater agent");
+
+const tmpMsgHome = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-plan-msg-"));
+const msgPlanDir = path.join(tmpMsgHome, ".claude", "plans");
+fs.mkdirSync(msgPlanDir, { recursive: true });
+fs.writeFileSync(path.join(msgPlanDir, "msg-plan.md"), bigPlan, "utf-8");
+
+const msgResult = runPlanGate(
+  { session_id: "plan-msg-test" },
+  { USERPROFILE: tmpMsgHome, HOME: tmpMsgHome }
+);
+if (msgResult.stdout.trim()) {
+  const msgOutput = JSON.parse(msgResult.stdout);
+  assert(msgOutput.reason.includes("claude-gates:gater"), "block message mentions claude-gates:gater");
+  assert(!msgOutput.reason.includes("/verify"), "block message does not mention /verify");
+} else {
+  assert(false, "block message mentions claude-gates:gater (no output)");
+  assert(false, "block message does not mention /verify (no output)");
+}
+
+fs.rmSync(tmpMsgHome, { recursive: true, force: true });
 
 // ── config module ────────────────────────────────────────────────────
 
@@ -1430,20 +1461,10 @@ for (let i = 1; i <= 6; i++) {
 }
 
 // Verify file count tracked
-const editEnhDbPath = path.join(editEnhSessionDir, "session.db");
-const editEnhStatsPath = path.join(editEnhSessionDir, "edit_stats.json");
-if (fs.existsSync(editEnhDbPath)) {
-  const eenhDb = gatesDb.getDb(editEnhSessionDir);
-  const counts = gatesDb.getEditCounts(eenhDb);
-  // File count derived from edits table; may be adjusted by lazy git diff, but should be > 0
-  assert(counts.files > 0, "edit-gate tracks file count (DB)");
-  eenhDb.close();
-} else if (fs.existsSync(editEnhStatsPath)) {
-  const stats = JSON.parse(fs.readFileSync(editEnhStatsPath, "utf-8"));
-  assert(stats.total_files > 0, "edit-gate tracks file count (JSON)");
-} else {
-  assert(true, "edit-gate tracking (no DB/stats file — git diff may have reset)");
-}
+const eenhDb = gatesDb.getDb(editEnhSessionDir);
+const counts = gatesDb.getEditCounts(eenhDb);
+assert(counts.files > 0, "edit-gate tracks file count (DB)");
+eenhDb.close();
 
 // Test: dedup — same file again should not increment count
 runEditGate({
@@ -1451,14 +1472,12 @@ runEditGate({
   tool_input: { file_path: "/tmp/file-1.js" }
 }, { USERPROFILE: tmpEditEnhanced, HOME: tmpEditEnhanced });
 
-if (fs.existsSync(editEnhDbPath)) {
-  const eenhDb2 = gatesDb.getDb(editEnhSessionDir);
-  const edits = gatesDb.getEdits(eenhDb2);
-  const normalizedPath = path.resolve("/tmp/file-1.js").replace(/\\/g, "/");
-  const count = edits.filter(e => e === normalizedPath).length;
-  assert(count === 1, "edit-gate does not duplicate on re-edit (DB)");
-  eenhDb2.close();
-}
+const eenhDb2 = gatesDb.getDb(editEnhSessionDir);
+const eenhEdits = gatesDb.getEdits(eenhDb2);
+const eenhNorm = path.resolve("/tmp/file-1.js").replace(/\\/g, "/");
+const eenhCount = eenhEdits.filter(e => e === eenhNorm).length;
+assert(eenhCount === 1, "edit-gate does not duplicate on re-edit (DB)");
+eenhDb2.close();
 
 fs.rmSync(tmpEditEnhanced, { recursive: true, force: true });
 
@@ -1470,15 +1489,12 @@ const tmpStopArtifact = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stop-artif
 const stopArtSessionDir = path.join(tmpStopArtifact, ".claude", "sessions", "stop-art-test");
 fs.mkdirSync(stopArtSessionDir, { recursive: true });
 
-// Seed session_scopes with one PASS and one pending agent in same scope
-fs.writeFileSync(path.join(stopArtSessionDir, "session_scopes.json"), JSON.stringify({
-  "task-art": {
-    cleared: {
-      implementer: { verdict: "PASS", round: 1 },
-      reviewer: { verdict: null }
-    }
-  }
-}, null, 2), "utf-8");
+// Seed SQLite with one PASS and one pending agent in same scope
+const artSetupDb = gatesDb.getDb(stopArtSessionDir);
+gatesDb.registerAgent(artSetupDb, "task-art", "implementer", null);
+gatesDb.setVerdict(artSetupDb, "task-art", "implementer", "PASS", 1);
+gatesDb.registerAgent(artSetupDb, "task-art", "reviewer", null);
+artSetupDb.close();
 
 // Create implementer artifact but NOT reviewer
 const artScopeDir = path.join(stopArtSessionDir, "task-art");
@@ -1488,7 +1504,9 @@ fs.writeFileSync(path.join(artScopeDir, "implementer.md"), "Result: PASS\n", "ut
 // Need at least one edit to trigger stop-gate scan
 const artDummyFile = path.join(tmpStopArtifact, "clean.js");
 fs.writeFileSync(artDummyFile, "const x = 1;\n", "utf-8");
-fs.writeFileSync(path.join(stopArtSessionDir, "edits.log"), artDummyFile.replace(/\\/g, "/") + "\n", "utf-8");
+const artDb = gatesDb.getDb(stopArtSessionDir);
+gatesDb.addEdit(artDb, artDummyFile.replace(/\\/g, "/"));
+artDb.close();
 
 const stopArtResult = runStopGate(
   { session_id: "stop-art-test" },
@@ -1511,16 +1529,14 @@ const tmpStopAbandoned = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stop-aban
 const stopAbSessionDir = path.join(tmpStopAbandoned, ".claude", "sessions", "stop-ab-test");
 fs.mkdirSync(stopAbSessionDir, { recursive: true });
 
-fs.writeFileSync(path.join(stopAbSessionDir, "session_scopes.json"), JSON.stringify({
-  "task-abandoned": {
-    cleared: {
-      implementer: { verdict: "REVISE" },
-      reviewer: { verdict: null }
-    }
-  }
-}, null, 2), "utf-8");
+// Seed abandoned scope in SQLite (no PASS/CONVERGED agents → scope skipped)
+const abDb = gatesDb.getDb(stopAbSessionDir);
+gatesDb.registerAgent(abDb, "task-abandoned", "implementer", null);
+gatesDb.setVerdict(abDb, "task-abandoned", "implementer", "REVISE", 1);
+gatesDb.registerAgent(abDb, "task-abandoned", "reviewer", null);
+abDb.close();
 
-// No edits.log → should pass (no debug leftovers, abandoned scope skipped)
+// No edits → should pass (no debug leftovers, abandoned scope skipped)
 const abandonedResult = runStopGate(
   { session_id: "stop-ab-test" },
   { USERPROFILE: tmpStopAbandoned, HOME: tmpStopAbandoned }
@@ -1537,7 +1553,7 @@ describe("SQLite DB: gates operations");
 
 const tmpGates = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gates-"));
 const gDb = gatesDb.getDb(tmpGates);
-if (gDb) {
+{
   // Verify table exists
   const gtTables = gDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='gates'").get();
   assert(!!gtTables, "gates table exists");
@@ -1647,8 +1663,6 @@ if (gDb) {
   assert(noFixerGates[0].fixer_agent === null, "initGates without fixer stores null");
 
   gDb.close();
-} else {
-  console.log("  SKIP: gates tests — better-sqlite3 not available");
 }
 fs.rmSync(tmpGates, { recursive: true, force: true });
 
@@ -1722,21 +1736,11 @@ assert(!gaterResult.stdout.includes("block"), "gater fallback does not block");
 
 // Verify verdict was recorded
 const gfDb = gatesDb.getDb(gaterSessionDir);
-if (gfDb) {
-  const row = gfDb.prepare(
-    "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
-  ).get();
-  assert(row && row.verdict === "PASS", "gater PASS verdict recorded in SQLite");
-  gfDb.close();
-} else {
-  try {
-    const scopes = JSON.parse(fs.readFileSync(path.join(gaterSessionDir, "session_scopes.json"), "utf-8"));
-    const entry = scopes["gater-review"] && scopes["gater-review"].cleared && scopes["gater-review"].cleared.gater;
-    assert(entry && entry.verdict === "PASS", "gater PASS verdict recorded in JSON");
-  } catch {
-    assert(false, "gater PASS verdict recorded (no scopes file found)");
-  }
-}
+const row = gfDb.prepare(
+  "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
+).get();
+assert(row && row.verdict === "PASS", "gater PASS verdict recorded in SQLite");
+gfDb.close();
 
 // Test: gater with no Result: line → no verdict recorded
 const tmpGaterHome2 = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gater-fb2-"));
@@ -1753,16 +1757,11 @@ const gaterResult2 = runVerification({
 assert(gaterResult2.exitCode === 0, "gater no-verdict exits 0");
 
 const gf2Db = gatesDb.getDb(gaterSessionDir2);
-if (gf2Db) {
-  const row2 = gf2Db.prepare(
-    "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
-  ).get();
-  assert(!row2, "no verdict recorded when message lacks Result: line");
-  gf2Db.close();
-} else {
-  const scopesExists = fs.existsSync(path.join(gaterSessionDir2, "session_scopes.json"));
-  assert(!scopesExists, "no verdict recorded when message lacks Result: line (JSON)");
-}
+const row2 = gf2Db.prepare(
+  "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
+).get();
+assert(!row2, "no verdict recorded when message lacks Result: line");
+gf2Db.close();
 
 // Test: gater with CONVERGED → verdict recorded as CONVERGED
 const tmpGaterHome3 = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-gater-fb3-"));
@@ -1779,21 +1778,11 @@ const gaterResult3 = runVerification({
 assert(gaterResult3.exitCode === 0, "gater CONVERGED exits 0");
 
 const gf3Db = gatesDb.getDb(gaterSessionDir3);
-if (gf3Db) {
-  const row3 = gf3Db.prepare(
-    "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
-  ).get();
-  assert(row3 && row3.verdict === "CONVERGED", "gater CONVERGED verdict recorded");
-  gf3Db.close();
-} else {
-  try {
-    const scopes3 = JSON.parse(fs.readFileSync(path.join(gaterSessionDir3, "session_scopes.json"), "utf-8"));
-    const entry3 = scopes3["gater-review"] && scopes3["gater-review"].cleared && scopes3["gater-review"].cleared.gater;
-    assert(entry3 && entry3.verdict === "CONVERGED", "gater CONVERGED verdict recorded (JSON)");
-  } catch {
-    assert(false, "gater CONVERGED verdict recorded (no scopes file found)");
-  }
-}
+const row3 = gf3Db.prepare(
+  "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
+).get();
+assert(row3 && row3.verdict === "CONVERGED", "gater CONVERGED verdict recorded");
+gf3Db.close();
 
 fs.rmSync(tmpGaterHome, { recursive: true, force: true });
 fs.rmSync(tmpGaterHome2, { recursive: true, force: true });
@@ -1815,21 +1804,11 @@ assert(gaterResult4.exitCode === 0, "plugin-qualified gater exits 0");
 assert(!gaterResult4.stdout.includes("block"), "plugin-qualified gater does not block");
 
 const gf4Db = gatesDb.getDb(gaterSessionDir4);
-if (gf4Db) {
-  const row4 = gf4Db.prepare(
-    "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
-  ).get();
-  assert(row4 && row4.verdict === "PASS", "plugin-qualified gater PASS verdict recorded in SQLite");
-  gf4Db.close();
-} else {
-  try {
-    const scopes4 = JSON.parse(fs.readFileSync(path.join(gaterSessionDir4, "session_scopes.json"), "utf-8"));
-    const entry4 = scopes4["gater-review"] && scopes4["gater-review"].cleared && scopes4["gater-review"].cleared.gater;
-    assert(entry4 && entry4.verdict === "PASS", "plugin-qualified gater PASS verdict recorded in JSON");
-  } catch {
-    assert(false, "plugin-qualified gater PASS verdict recorded (no scopes file found)");
-  }
-}
+const row4 = gf4Db.prepare(
+  "SELECT verdict FROM agents WHERE scope = 'gater-review' AND agent = 'gater'"
+).get();
+assert(row4 && row4.verdict === "PASS", "plugin-qualified gater PASS verdict recorded in SQLite");
+gf4Db.close();
 
 fs.rmSync(tmpGaterHome4, { recursive: true, force: true });
 

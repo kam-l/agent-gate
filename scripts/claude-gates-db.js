@@ -3,11 +3,10 @@
  * ClaudeGates v2 — SQLite session state module.
  *
  * 4-table schema: agents, gates, edits, tool_history.
- * Falls back gracefully: if better-sqlite3 is not installed, getDb() returns null
- * and all hooks use existing JSON code paths.
+ * Requires better-sqlite3 (native SQLite binding).
  *
  * Exports:
- *   getDb(sessionDir)                              → Database | null
+ *   getDb(sessionDir)                              → Database
  *   registerAgent(db, scope, agent, outputFilepath) → void
  *   setVerdict(db, scope, agent, verdict, round)   → void
  *   getAgent(db, scope, agent)                     → row | null
@@ -41,7 +40,15 @@ const fs = require("fs");
 const path = require("path");
 
 let Database;
-try { Database = require("better-sqlite3"); } catch { Database = null; }
+try {
+  Database = require("better-sqlite3");
+} catch (e) {
+  process.stderr.write(
+    `[ClaudeGates] FATAL: better-sqlite3 not found. Run "npm install" in the plugin directory.\n` +
+    `  Plugin path: ${__dirname.replace(/[\\/]scripts$/, "")}\n`
+  );
+  throw e;
+}
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS agents (
@@ -88,11 +95,8 @@ END;
 
 /**
  * Open session DB, create tables, migrate if needed.
- * Returns null if better-sqlite3 is not available.
  */
 function getDb(sessionDir) {
-  if (!Database) return null;
-
   if (!fs.existsSync(sessionDir)) {
     fs.mkdirSync(sessionDir, { recursive: true });
   }

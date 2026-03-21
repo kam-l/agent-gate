@@ -5,13 +5,12 @@
  * Blocks ExitPlanMode until plan has been verified by gater agent.
  *
  * Allows if:
- *   - gater agent has a PASS or CONVERGED verdict in session_scopes, OR
+ *   - gater agent has a PASS or CONVERGED verdict in SQLite, OR
  *   - most recent .md in ~/.claude/plans/ is <=20 lines (trivial plan), OR
  *   - plans dir is absent (fail-open), OR
  *   - plan_gate_attempts >= MAX_ATTEMPTS (safety valve)
  *
- * Verdict-based: reads gater verdicts from the cleared table (SQLite) or
- * session_scopes.json (JSON fallback). No separate stamp mechanism needed.
+ * Verdict-based: reads gater verdicts from the agents table (SQLite).
  *
  * Fail-open.
  */
@@ -33,39 +32,17 @@ try {
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId);
   const plansDir = path.join(HOME, ".claude", "plans");
 
-  // ── Check for gater verdict ──
+  // ── Check for gater verdict (SQLite) ──
   const db = getDb(sessionDir);
   let gaterVerified = false;
 
-  if (db) {
-    // SQLite: check agents table for any verifier with PASS or CONVERGED
-    try {
-      const row = db.prepare(
-        "SELECT 1 FROM agents WHERE agent IN ('gater','adversary') AND verdict IN ('PASS','CONVERGED') LIMIT 1"
-      ).get();
-      gaterVerified = !!row;
-    } catch {}
-    db.close();
-  } else {
-    // JSON fallback: scan session_scopes.json
-    try {
-      const scopesFile = path.join(sessionDir, "session_scopes.json");
-      const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
-      const verifiers = ["gater", "adversary"];
-      for (const [scope, info] of Object.entries(scopes)) {
-        if (scope === "_pending" || !info || !info.cleared) continue;
-        for (const v of verifiers) {
-          const entry = info.cleared[v];
-          if (entry && typeof entry === "object" &&
-              (entry.verdict === "PASS" || entry.verdict === "CONVERGED")) {
-            gaterVerified = true;
-            break;
-          }
-        }
-        if (gaterVerified) break;
-      }
-    } catch {}
-  }
+  try {
+    const row = db.prepare(
+      "SELECT 1 FROM agents WHERE agent = 'gater' AND verdict IN ('PASS','CONVERGED') LIMIT 1"
+    ).get();
+    gaterVerified = !!row;
+  } catch {}
+  db.close();
 
   if (gaterVerified) process.exit(0); // verified — allow
 
@@ -88,35 +65,21 @@ try {
 
   // ── Attempt tracking — auto-allow after MAX_ATTEMPTS ──
   const db2 = getDb(sessionDir);
-  if (db2) {
-    incrAttempts(db2, "_system", "plan-gate");
-    const attempts = getAttempts(db2, "_system", "plan-gate");
-    if (attempts >= MAX_ATTEMPTS) {
-      resetAttempts(db2, "_system", "plan-gate");
-      db2.close();
-      process.stderr.write(`[ClaudeGates] Plan gate safety valve activated.\n`);
-      process.exit(0);
-    }
+  incrAttempts(db2, "_system", "plan-gate");
+  const attempts = getAttempts(db2, "_system", "plan-gate");
+  if (attempts >= MAX_ATTEMPTS) {
+    resetAttempts(db2, "_system", "plan-gate");
     db2.close();
-  } else {
-    const attemptsFile = path.join(sessionDir, "plan_gate_attempts");
-    let attempts = 0;
-    try { attempts = parseInt(fs.readFileSync(attemptsFile, "utf-8").trim(), 10) || 0; } catch {}
-    attempts++;
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-    fs.writeFileSync(attemptsFile, String(attempts), "utf-8");
-    if (attempts >= MAX_ATTEMPTS) {
-      fs.writeFileSync(attemptsFile, "0", "utf-8");
-      process.stderr.write(`[ClaudeGates] Plan gate safety valve activated.\n`);
-      process.exit(0);
-    }
+    process.stderr.write(`[ClaudeGates] Plan gate safety valve activated.\n`);
+    process.exit(0);
   }
+  db2.close();
 
   // ── Block ──
   process.stdout.write(JSON.stringify({
     decision: "block",
     reason: `[ClaudeGates] Plan "${planFiles[0].name}" has ${lines} lines and hasn't been verified.` +
-      ` Run /verify ${planPath.replace(/\\/g, "/")} before exiting plan mode.`
+      ` Spawn claude-gates:gater with scope=verify-plan to review the plan before exiting.`
   }));
   process.exit(0);
 } catch {

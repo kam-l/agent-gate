@@ -46,134 +46,62 @@ try {
   // Normalize path (resolve + forward slashes)
   const normalized = path.resolve(filePath).replace(/\\/g, "/");
 
-  // Dual-path: SQLite (atomic) or JSON (fallback)
+  // SQLite: track edits and check thresholds
   const db = getDb(sessionDir);
-  if (db) {
-    // Check if this is a new file (not already tracked)
-    const editsBefore = getEdits(db);
-    const isNew = !editsBefore.includes(normalized);
 
-    // Track the file
-    addEdit(db, normalized);
+  // Check if this is a new file (not already tracked)
+  const editsBefore = getEdits(db);
+  const isNew = !editsBefore.includes(normalized);
 
-    if (isNew) {
-      const counts = getEditCounts(db);
+  // Track the file
+  addEdit(db, normalized);
 
-      // Lazy git stats: compute every CHECK_INTERVAL unique files
-      if (counts.files % CHECK_INTERVAL === 0) {
-        try {
-          const stat = execSync("git diff --numstat", {
-            encoding: "utf-8",
-            timeout: 5000,
-            stdio: ["pipe", "pipe", "pipe"]
-          });
+  if (isNew) {
+    const counts = getEditCounts(db);
 
-          // Reset all line counts
-          db.prepare("UPDATE edits SET lines = 0").run();
+    // Lazy git stats: compute every CHECK_INTERVAL unique files
+    if (counts.files % CHECK_INTERVAL === 0) {
+      try {
+        const stat = execSync("git diff --numstat", {
+          encoding: "utf-8",
+          timeout: 5000,
+          stdio: ["pipe", "pipe", "pipe"]
+        });
 
-          // Parse per-file stats: additions\tdeletions\tfilepath
-          const diffLines = stat.trim().split("\n").filter(Boolean);
-          for (const line of diffLines) {
-            const parts = line.split("\t");
-            if (parts.length >= 3) {
-              const add = parseInt(parts[0], 10) || 0;
-              const del = parseInt(parts[1], 10) || 0;
-              const absPath = path.resolve(parts.slice(2).join("\t")).replace(/\\/g, "/");
-              addEdit(db, absPath, add + del);
-            }
+        // Reset all line counts
+        db.prepare("UPDATE edits SET lines = 0").run();
+
+        // Parse per-file stats: additions\tdeletions\tfilepath
+        const diffLines = stat.trim().split("\n").filter(Boolean);
+        for (const line of diffLines) {
+          const parts = line.split("\t");
+          if (parts.length >= 3) {
+            const add = parseInt(parts[0], 10) || 0;
+            const del = parseInt(parts[1], 10) || 0;
+            const absPath = path.resolve(parts.slice(2).join("\t")).replace(/\\/g, "/");
+            addEdit(db, absPath, add + del);
           }
+        }
 
-          // If git shows no changes, everything was committed
-          if (diffLines.length === 0) {
-            db.prepare("DELETE FROM edits").run();
-          }
-        } catch {} // git unavailable — skip stats
-      }
-
-      // Check thresholds using derived counts
-      const finalCounts = getEditCounts(db);
-
-      if (finalCounts.files >= FILE_THRESHOLD || finalCounts.lines >= LINE_THRESHOLD) {
-        const parts = [];
-        if (finalCounts.files >= FILE_THRESHOLD) parts.push(`${finalCounts.files} files`);
-        if (finalCounts.lines >= LINE_THRESHOLD) parts.push(`${finalCounts.lines} lines`);
-        process.stderr.write(`[ClaudeGates] ${parts.join(" / ")} changed without commit. Consider committing.\n`);
-      }
+        // If git shows no changes, everything was committed
+        if (diffLines.length === 0) {
+          db.prepare("DELETE FROM edits").run();
+        }
+      } catch {} // git unavailable — skip stats
     }
 
-    db.close();
-  } else {
-    // JSON fallback
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
+    // Check thresholds using derived counts
+    const finalCounts = getEditCounts(db);
 
-    const logFile = path.join(sessionDir, "edits.log");
-    const statsFile = path.join(sessionDir, "edit_stats.json");
-
-    // Read existing entries into Set for dedup
-    const existing = new Set();
-    try {
-      const content = fs.readFileSync(logFile, "utf-8");
-      for (const line of content.split("\n")) {
-        if (line.trim()) existing.add(line.trim());
-      }
-    } catch {} // missing → empty set
-
-    const isNew = !existing.has(normalized);
-
-    // Append if new
-    if (isNew) {
-      fs.appendFileSync(logFile, normalized + "\n", "utf-8");
-
-      // Load/update stats
-      let stats = { total_files: 0, total_additions: 0, total_deletions: 0 };
-      try { stats = JSON.parse(fs.readFileSync(statsFile, "utf-8")); } catch {}
-      stats.total_files = (stats.total_files || 0) + 1;
-
-      // Lazy git stats
-      if (stats.total_files % CHECK_INTERVAL === 0) {
-        try {
-          const stat = execSync("git diff --stat", {
-            encoding: "utf-8",
-            timeout: 5000,
-            stdio: ["pipe", "pipe", "pipe"]
-          });
-
-          const summaryMatch = stat.match(/(\d+) files? changed(?:,\s*(\d+) insertions?\(\+\))?(?:,\s*(\d+) deletions?\(-\))?/);
-          if (summaryMatch) {
-            const gitFiles = parseInt(summaryMatch[1], 10) || 0;
-            const additions = parseInt(summaryMatch[2], 10) || 0;
-            const deletions = parseInt(summaryMatch[3], 10) || 0;
-
-            if (gitFiles < stats.total_files) stats.total_files = gitFiles;
-            if (gitFiles === 0) {
-              stats.total_additions = 0;
-              stats.total_deletions = 0;
-            } else {
-              stats.total_additions = additions;
-              stats.total_deletions = deletions;
-            }
-          } else if (!stat.trim()) {
-            stats.total_files = 0;
-            stats.total_additions = 0;
-            stats.total_deletions = 0;
-          }
-        } catch {} // git unavailable
-      }
-
-      fs.writeFileSync(statsFile, JSON.stringify(stats), "utf-8");
-
-      // Check thresholds
-      const netLines = (stats.total_additions || 0) + (stats.total_deletions || 0);
-      if (stats.total_files >= FILE_THRESHOLD || netLines >= LINE_THRESHOLD) {
-        const parts = [];
-        if (stats.total_files >= FILE_THRESHOLD) parts.push(`${stats.total_files} files`);
-        if (netLines >= LINE_THRESHOLD) parts.push(`${netLines} lines`);
-        process.stderr.write(`[ClaudeGates] ${parts.join(" / ")} changed without commit. Consider committing.\n`);
-      }
+    if (finalCounts.files >= FILE_THRESHOLD || finalCounts.lines >= LINE_THRESHOLD) {
+      const parts = [];
+      if (finalCounts.files >= FILE_THRESHOLD) parts.push(`${finalCounts.files} files`);
+      if (finalCounts.lines >= LINE_THRESHOLD) parts.push(`${finalCounts.lines} lines`);
+      process.stderr.write(`[ClaudeGates] ${parts.join(" / ")} changed without commit. Consider committing.\n`);
     }
   }
+
+  db.close();
 
   process.exit(0);
 } catch {

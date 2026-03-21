@@ -29,85 +29,37 @@ try {
   const HOME = process.env.USERPROFILE || process.env.HOME || "";
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId);
 
-  // Dual-path: SQLite or JSON
+  // SQLite: completeness check + debug scan
   const db = getDb(sessionDir);
   let files;
   const issues = [];
 
-  if (db) {
-    // SQLite path
-    if (isCleared(db, "_nudge", "stop-gate")) { db.close(); process.exit(0); }
+  if (isCleared(db, "_nudge", "stop-gate")) { db.close(); process.exit(0); }
 
-    // ── Artifact completeness check ──
-    try {
-      const incomplete = db.prepare(
-        "SELECT scope, agent FROM agents WHERE (verdict IS NULL OR verdict = 'REVISE') AND SUBSTR(scope, 1, 1) != '_'"
-      ).all();
+  // ── Artifact completeness check ──
+  try {
+    const incomplete = db.prepare(
+      "SELECT scope, agent FROM agents WHERE (verdict IS NULL OR verdict = 'REVISE') AND SUBSTR(scope, 1, 1) != '_'"
+    ).all();
 
-      for (const row of incomplete) {
-        // Check if scope is active (has at least one PASS/CONVERGED agent)
-        const active = db.prepare(
-          "SELECT 1 FROM agents WHERE scope = ? AND verdict IN ('PASS','CONVERGED') LIMIT 1"
-        ).get(row.scope);
+    for (const row of incomplete) {
+      // Check if scope is active (has at least one PASS/CONVERGED agent)
+      const active = db.prepare(
+        "SELECT 1 FROM agents WHERE scope = ? AND verdict IN ('PASS','CONVERGED') LIMIT 1"
+      ).get(row.scope);
 
-        if (!active) continue; // scope abandoned or not started — skip
+      if (!active) continue; // scope abandoned or not started — skip
 
-        // Check if artifact file exists
-        const artifactPath = path.join(sessionDir, row.scope, row.agent + ".md");
-        if (!fs.existsSync(artifactPath)) {
-          issues.push(`  ${row.scope}/${row.agent}: missing artifact (verdict: ${row.verdict || "none"})`);
-        }
+      // Check if artifact file exists
+      const artifactPath = path.join(sessionDir, row.scope, row.agent + ".md");
+      if (!fs.existsSync(artifactPath)) {
+        issues.push(`  ${row.scope}/${row.agent}: missing artifact (verdict: ${row.verdict || "none"})`);
       }
-    } catch {} // non-fatal
-
-    files = getEdits(db);
-    if (files.length === 0 && issues.length === 0) { db.close(); process.exit(0); }
-  } else {
-    // JSON path
-    const logFile = path.join(sessionDir, "edits.log");
-    const markerFile = path.join(sessionDir, ".stop-gate-nudged");
-
-    if (fs.existsSync(markerFile)) process.exit(0);
-
-    // JSON artifact completeness check
-    try {
-      const scopesFile = path.join(sessionDir, "session_scopes.json");
-      if (fs.existsSync(scopesFile)) {
-        const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
-        for (const [scope, info] of Object.entries(scopes)) {
-          if (scope === "_pending" || !info || !info.cleared) continue;
-          const cleared = info.cleared;
-          const hasCompleted = Object.values(cleared).some(v =>
-            v && typeof v === "object" && (v.verdict === "PASS" || v.verdict === "CONVERGED")
-          );
-          if (!hasCompleted) continue;
-
-          for (const [agent, val] of Object.entries(cleared)) {
-            const verdict = (val && typeof val === "object") ? val.verdict : null;
-            if (verdict === null || verdict === "REVISE") {
-              const artifactPath = path.join(sessionDir, scope, agent + ".md");
-              if (!fs.existsSync(artifactPath)) {
-                issues.push(`  ${scope}/${agent}: missing artifact (verdict: ${verdict || "none"})`);
-              }
-            }
-          }
-        }
-      }
-    } catch {} // non-fatal
-
-    if (!fs.existsSync(logFile) && issues.length === 0) process.exit(0);
-
-    try {
-      files = fs.readFileSync(logFile, "utf-8")
-        .split("\n")
-        .map(l => l.trim())
-        .filter(Boolean);
-    } catch {
-      files = [];
     }
+  } catch {} // non-fatal
 
-    if (files.length === 0 && issues.length === 0) process.exit(0);
-  }
+  files = getEdits(db);
+  if (files.length === 0 && issues.length === 0) { db.close(); process.exit(0); }
 
   // ── Debug leftover scan (configurable patterns) ──
   const config = loadConfig();
@@ -174,7 +126,7 @@ try {
   }
 
   if (matches.length === 0 && issues.length === 0) {
-    if (db) db.close();
+    db.close();
     process.exit(0);
   }
 
@@ -196,23 +148,15 @@ try {
 
   if (config.stop_gate.mode === "nudge") {
     // Block-once: set marker so second stop passes
-    if (db) {
-      try { registerAgent(db, "_nudge", "stop-gate", null); } catch {}
-      db.close();
-    } else {
-      try {
-        const markerFile = path.join(sessionDir, ".stop-gate-nudged");
-        if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-        fs.writeFileSync(markerFile, new Date().toISOString(), "utf-8");
-      } catch {}
-    }
+    try { registerAgent(db, "_nudge", "stop-gate", null); } catch {}
+    db.close();
     process.stdout.write(JSON.stringify({
       decision: "block",
       reason: `[ClaudeGates] ${summary}\nClean up or stop again to proceed.`
     }));
   } else {
     // Warn mode (default): stderr only, no block
-    if (db) db.close();
+    db.close();
     process.stderr.write(`[ClaudeGates] ${summary}\n`);
   }
   process.exit(0);

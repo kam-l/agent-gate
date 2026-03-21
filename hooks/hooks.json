@@ -68,6 +68,16 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/plan-gate-clear.js",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
         "matcher": "Edit",
         "hooks": [
           {

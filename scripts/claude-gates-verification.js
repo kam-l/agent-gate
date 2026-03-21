@@ -7,7 +7,7 @@
  *   Layer 2 (semantic): claude -p judges whether content is substantive
  *
  * Verdict recording:
- *   After verification, records structured verdict objects to session_scopes.json
+ *   After verification, records structured verdict objects to SQLite
  *   with round tracking.
  *
  * Fail-open on infrastructure errors. Hard-block on intentional gates.
@@ -48,7 +48,7 @@ try {
       try {
         recordVerdict(sessionDir, "gater-review", bareAgentType, gaterVerdict[1], db);
       } finally {
-        if (db) try { db.close(); } catch {}
+        db.close();
       }
     }
     process.exit(0);
@@ -65,35 +65,32 @@ try {
   // No verification prompt AND no gates → check if agent is a fixer/source for active gates
   if (!verification && !agentGates) {
     const db0 = gatesDb.getDb(sessionDir);
-    if (db0) {
-      try {
-        // Check if this agent is a fixer completing for a gate in 'fix' status
-        const fixRow = db0.prepare(
-          "SELECT scope FROM gates WHERE fixer_agent = ? AND status = 'fix' LIMIT 1"
-        ).get(bareAgentType);
-        if (fixRow) {
-          const finalVerdict = extractVerdict(lastMessage);
-          processGateTransitions(db0, fixRow.scope, bareAgentType, finalVerdict, mdContent);
-          process.exit(0);
-        }
-        // Check if this agent is a source completing for a gate in 'revise' status
-        const revRow = db0.prepare(
-          "SELECT scope FROM gates WHERE source_agent = ? AND status = 'revise' LIMIT 1"
-        ).get(bareAgentType);
-        if (revRow) {
-          const finalVerdict = extractVerdict(lastMessage);
-          processGateTransitions(db0, revRow.scope, bareAgentType, finalVerdict, mdContent);
-          process.exit(0);
-        }
-      } finally {
-        try { db0.close(); } catch {}
+    try {
+      // Check if this agent is a fixer completing for a gate in 'fix' status
+      const fixRow = db0.prepare(
+        "SELECT scope FROM gates WHERE fixer_agent = ? AND status = 'fix' LIMIT 1"
+      ).get(bareAgentType);
+      if (fixRow) {
+        const finalVerdict = extractVerdict(lastMessage);
+        processGateTransitions(db0, fixRow.scope, bareAgentType, finalVerdict, mdContent);
+        process.exit(0);
       }
+      // Check if this agent is a source completing for a gate in 'revise' status
+      const revRow = db0.prepare(
+        "SELECT scope FROM gates WHERE source_agent = ? AND status = 'revise' LIMIT 1"
+      ).get(bareAgentType);
+      if (revRow) {
+        const finalVerdict = extractVerdict(lastMessage);
+        processGateTransitions(db0, revRow.scope, bareAgentType, finalVerdict, mdContent);
+        process.exit(0);
+      }
+    } finally {
+      db0.close();
     }
     process.exit(0);
   }
 
 
-  // Open DB (null if better-sqlite3 unavailable → JSON fallback)
   const db = gatesDb.getDb(sessionDir);
 
   try {
@@ -133,7 +130,7 @@ try {
     // No scope match → fail-open (ungated usage)
     process.exit(0);
   } finally {
-    if (db) try { db.close(); } catch {}
+    db.close();
   }
 } catch (err) {
   process.stderr.write(`[ClaudeGates verification] Error: ${err.message}\n`);
@@ -161,60 +158,23 @@ function extractArtifactPath(message, sessionDir, agentType) {
 }
 
 /**
- * Find which scope this agent was cleared for.
- * Dual-path: SQLite if available, JSON fallback.
+ * Find which scope this agent was cleared for (SQLite).
  */
 function findClearedScope(sessionDir, agentType, db) {
-  if (db) {
-    return gatesDb.findAgentScope(db, agentType);
-  }
-  // JSON fallback
-  try {
-    const scopesFile = path.join(sessionDir, "session_scopes.json");
-    const scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
-    for (const [scope, info] of Object.entries(scopes)) {
-      if (info.cleared && info.cleared[agentType]) return scope;
-    }
-  } catch {}
-  return null;
+  return gatesDb.findAgentScope(db, agentType);
 }
 
 /**
- * Record a structured verdict object.
- * Dual-path: SQLite (atomic) or JSON (read-modify-write fallback).
+ * Record a structured verdict object (SQLite).
  * Returns { verdict, round } or null on error.
  */
 function recordVerdict(sessionDir, scope, agentType, verdict, db) {
   if (!scope || !sessionDir) return null;
   try {
-    if (db) {
-      // SQLite path — atomic read + write
-      const existing = gatesDb.getAgent(db, scope, agentType);
-      const round = (existing && existing.round) ? existing.round + 1 : 1;
-      gatesDb.setVerdict(db, scope, agentType, verdict, round);
-      return { verdict, round };
-    }
-
-    // JSON fallback (existing behavior)
-    const scopesFile = path.join(sessionDir, "session_scopes.json");
-    let scopes = {};
-    try {
-      scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
-    } catch {} // missing → start fresh
-
-    if (!scopes[scope]) scopes[scope] = { cleared: {} };
-
-    const existing = scopes[scope].cleared[agentType];
-    const round = (existing && typeof existing === "object" && existing.round) ? existing.round + 1 : 1;
-    const verdictObj = { verdict, round };
-    scopes[scope].cleared[agentType] = verdictObj;
-
-    if (!fs.existsSync(path.dirname(scopesFile))) {
-      fs.mkdirSync(path.dirname(scopesFile), { recursive: true });
-    }
-    fs.writeFileSync(scopesFile, JSON.stringify(scopes, null, 2), "utf-8");
-
-    return verdictObj;
+    const existing = gatesDb.getAgent(db, scope, agentType);
+    const round = (existing && existing.round) ? existing.round + 1 : 1;
+    gatesDb.setVerdict(db, scope, agentType, verdict, round);
+    return { verdict, round };
   } catch {
     return null;
   }
@@ -228,31 +188,15 @@ function validateScopeAndVerify(artifactInfo, verification, sessionDir, agentTyp
 
   // Validate scope registration
   if (scope) {
-    if (db) {
-      // SQLite path
-      if (!gatesDb.isCleared(db, scope, agentType)) {
-        // Check if scope exists at all
-        const scopeExists = db.prepare("SELECT 1 FROM agents WHERE scope = ?").get(scope);
-        if (!scopeExists) {
-          block(`Scope "${scope}" not registered. Were you spawned with scope=${scope}?`);
-          return;
-        }
-        block(`Agent "${agentType}" not cleared for scope "${scope}".`);
+    if (!gatesDb.isCleared(db, scope, agentType)) {
+      // Check if scope exists at all
+      const scopeExists = db.prepare("SELECT 1 FROM agents WHERE scope = ?").get(scope);
+      if (!scopeExists) {
+        block(`Scope "${scope}" not registered. Were you spawned with scope=${scope}?`);
         return;
       }
-    } else {
-      // JSON fallback
-      try {
-        const scopes = JSON.parse(fs.readFileSync(path.join(sessionDir, "session_scopes.json"), "utf-8"));
-        if (!scopes[scope]) {
-          block(`Scope "${scope}" not registered. Were you spawned with scope=${scope}?`);
-          return;
-        }
-        if (!scopes[scope].cleared || !scopes[scope].cleared[agentType]) {
-          block(`Agent "${agentType}" not cleared for scope "${scope}".`);
-          return;
-        }
-      } catch {} // missing scopes file → proceed (fail-open)
+      block(`Agent "${agentType}" not cleared for scope "${scope}".`);
+      return;
     }
   }
 
@@ -317,7 +261,7 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
   try {
     // Pipe prompt via stdin — eliminates shell injection and temp files
     result = execSync(
-      "claude -p --model sonnet --max-turns 1",
+      "claude -p --model sonnet --agent claude-gates:gater --max-turns 1",
       {
         input: combinedPrompt,
         cwd: PROJECT_ROOT,

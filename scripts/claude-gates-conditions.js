@@ -102,7 +102,7 @@ try {
     try {
       const condPrompt = conditions + "\n\nAgent spawn prompt:\n" + prompt;
       const condResult = execSync(
-        "claude -p --model sonnet --max-turns 1",
+        "claude -p --model sonnet --agent claude-gates:gater --max-turns 1",
         {
           input: condPrompt,
           cwd: PROJECT_ROOT,
@@ -137,67 +137,44 @@ try {
 
   const outputFilepath = path.join(scopeDir, `${agentType}.md`).replace(/\\/g, "/");
 
-  // Dual-path: SQLite (atomic) or JSON (fallback)
+  // SQLite: gate enforcement + scope registration
   const db = gatesDb.getDb(sessionDir);
-  if (db) {
-    // ── Gate enforcement (SQLite only) ──
-    const activeGate = gatesDb.getActiveGate(db, scope);
-    const reviseGate = gatesDb.getReviseGate(db, scope);
-    const fixGate = gatesDb.getFixGate(db, scope);
 
-    if (activeGate && agentType !== activeGate.gate_agent) {
-      process.stdout.write(JSON.stringify({
-        decision: "block",
-        reason: `[ClaudeGates] Scope "${scope}" has active gate: ${activeGate.gate_agent}. Spawn ${activeGate.gate_agent} with scope=${scope}.`
-      }));
-      db.close();
-      process.exit(0);
-    }
+  // ── Gate enforcement ──
+  const activeGate = gatesDb.getActiveGate(db, scope);
+  const reviseGate = gatesDb.getReviseGate(db, scope);
+  const fixGate = gatesDb.getFixGate(db, scope);
 
-    if (fixGate && agentType !== fixGate.fixer_agent) {
-      process.stdout.write(JSON.stringify({
-        decision: "block",
-        reason: `[ClaudeGates] Scope "${scope}" gate "${fixGate.gate_agent}" returned REVISE. Spawn fixer "${fixGate.fixer_agent}" with scope=${scope} to fix, then re-run the gate.`
-      }));
-      db.close();
-      process.exit(0);
-    }
-
-    if (reviseGate && agentType !== reviseGate.source_agent && agentType !== (reviseGate.fixer_agent || "")) {
-      process.stdout.write(JSON.stringify({
-        decision: "block",
-        reason: `[ClaudeGates] Scope "${scope}" gate "${reviseGate.gate_agent}" returned REVISE. Resume source agent "${reviseGate.source_agent}" with scope=${scope} to fix, then re-run the gate.`
-      }));
-      db.close();
-      process.exit(0);
-    }
-
-    // SQLite path — single atomic insert/update
-    gatesDb.registerAgent(db, scope, agentType, outputFilepath);
+  if (activeGate && agentType !== activeGate.gate_agent) {
+    process.stdout.write(JSON.stringify({
+      decision: "block",
+      reason: `[ClaudeGates] Scope "${scope}" has active gate: ${activeGate.gate_agent}. Spawn ${activeGate.gate_agent} with scope=${scope}.`
+    }));
     db.close();
-  } else {
-    // JSON path (existing behavior)
-    const scopesFile = path.join(sessionDir, "session_scopes.json");
-    let scopes = {};
-    try {
-      scopes = JSON.parse(fs.readFileSync(scopesFile, "utf-8"));
-    } catch {} // missing or invalid → start fresh
-
-    if (!scopes[scope]) scopes[scope] = { cleared: {} };
-    if (!scopes[scope].cleared[agentType]) {
-      scopes[scope].cleared[agentType] = true;
-    }
-
-    // Stage output_filepath for injection hook
-    if (!scopes._pending) scopes._pending = {};
-    scopes._pending[agentType] = { scope, outputFilepath };
-
-    // Ensure session dir exists before writing
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
-    fs.writeFileSync(scopesFile, JSON.stringify(scopes, null, 2), "utf-8");
+    process.exit(0);
   }
+
+  if (fixGate && agentType !== fixGate.fixer_agent) {
+    process.stdout.write(JSON.stringify({
+      decision: "block",
+      reason: `[ClaudeGates] Scope "${scope}" gate "${fixGate.gate_agent}" returned REVISE. Spawn fixer "${fixGate.fixer_agent}" with scope=${scope} to fix, then re-run the gate.`
+    }));
+    db.close();
+    process.exit(0);
+  }
+
+  if (reviseGate && agentType !== reviseGate.source_agent && agentType !== (reviseGate.fixer_agent || "")) {
+    process.stdout.write(JSON.stringify({
+      decision: "block",
+      reason: `[ClaudeGates] Scope "${scope}" gate "${reviseGate.gate_agent}" returned REVISE. Resume source agent "${reviseGate.source_agent}" with scope=${scope} to fix, then re-run the gate.`
+    }));
+    db.close();
+    process.exit(0);
+  }
+
+  // Single atomic insert/update
+  gatesDb.registerAgent(db, scope, agentType, outputFilepath);
+  db.close();
 
   // Allow
   process.exit(0);

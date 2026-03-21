@@ -37,50 +37,19 @@ try {
     .update(toolName + JSON.stringify(toolInput))
     .digest("hex");
 
-  // Dual-path: SQLite (atomic) or JSON (fallback)
+  // SQLite: atomic read + write with auto-trim trigger
   const db = getDb(sessionDir);
-  if (db) {
-    // SQLite path — atomic read + write with auto-trim trigger
-    const lastTwo = getLastNHashes(db, 2);
-    if (lastTwo.length >= 2 && lastTwo[0] === hash && lastTwo[1] === hash) {
-      db.close();
-      process.stdout.write(JSON.stringify({
-        decision: "block",
-        reason: `[ClaudeGates] Blocked: identical ${toolName} call repeated consecutively. Change your approach.`
-      }));
-      process.exit(0);
-    }
-    addToolHash(db, hash);
+  const lastTwo = getLastNHashes(db, 2);
+  if (lastTwo.length >= 2 && lastTwo[0] === hash && lastTwo[1] === hash) {
     db.close();
-  } else {
-    // JSON path (existing behavior)
-    const historyFile = path.join(sessionDir, "tool_history.json");
-
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
-
-    let history = [];
-    try {
-      history = JSON.parse(fs.readFileSync(historyFile, "utf-8"));
-      if (!Array.isArray(history)) history = [];
-    } catch {} // missing or invalid → empty
-
-    if (history.length >= 2 &&
-        history[history.length - 1] === hash &&
-        history[history.length - 2] === hash) {
-      process.stdout.write(JSON.stringify({
-        decision: "block",
-        reason: `[ClaudeGates] Blocked: identical ${toolName} call repeated consecutively. Change your approach.`
-      }));
-      process.exit(0);
-    }
-
-    history.push(hash);
-    if (history.length > 10) history = history.slice(-10);
-
-    fs.writeFileSync(historyFile, JSON.stringify(history), "utf-8");
+    process.stdout.write(JSON.stringify({
+      decision: "block",
+      reason: `[ClaudeGates] Blocked: identical ${toolName} call repeated consecutively. Change your approach.`
+    }));
+    process.exit(0);
   }
+  addToolHash(db, hash);
+  db.close();
 
   process.exit(0);
 } catch {
