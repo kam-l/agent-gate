@@ -4,7 +4,7 @@
  *
  * When gates are active, blocks ALL tools except:
  *   - Tool calls from an expected agent itself (detected via agent_type)
- *   - Read-only tools (Read, Glob, Grep)
+ *   - Read-only tools (Read, Glob, Grep) and progress tracking (TaskCreate, TaskUpdate)
  *   - Spawning an agent that matches ANY open scope's expected agent
  *
  * Scope-aware: supports parallel pipelines. Each scope tracks its own
@@ -18,7 +18,7 @@ const fs = require("fs");
 const path = require("path");
 const { getDb } = require("./claude-gates-db.js");
 
-const READ_ONLY_TOOLS = ["Read", "Glob", "Grep"];
+const ALLOWED_TOOLS = ["Read", "Glob", "Grep", "TaskCreate", "TaskUpdate"];
 
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -60,8 +60,8 @@ try {
   // deadlocks when parallel pipelines have active gates.
   if (callerAgent) process.exit(0);
 
-  // Read-only tools always allowed
-  if (READ_ONLY_TOOLS.includes(toolName)) process.exit(0);
+  // Read-only + progress tracking tools always allowed
+  if (ALLOWED_TOOLS.includes(toolName)) process.exit(0);
 
   // Agent tool: allow spawning any expected agent across all scopes
   if (toolName === "Agent") {
