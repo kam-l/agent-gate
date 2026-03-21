@@ -26,8 +26,7 @@ const DEFAULTS = {
     enabled: false
   },
   edit_gate: {
-    file_threshold: 10,
-    line_threshold: 200
+    commands: []
   }
 };
 

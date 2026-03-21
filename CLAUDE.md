@@ -34,10 +34,10 @@ Declarative pipeline gates — `requires:`, `verification:`, `conditions:`, and 
 - `plan-gate.js` — PreToolUse:ExitPlanMode. Verdict-based: checks SQLite for gater PASS/CONVERGED. Auto-allows after 3 attempts.
 - `plan-gate-clear.js` — PostToolUse:ExitPlanMode. Clears gater verdicts after every plan exit so next plan requires fresh verification.
 - `commit-gate.js` — PreToolUse:Bash. Detects `git commit`, runs configured validation commands. Opt-in via `claude-gates.json`.
-- `edit-gate.js` — PostToolUse:Edit|Write. Tracks edited files + git line stats. Configurable thresholds (default: 10 files / 200 lines).
+- `edit-gate.js` — PostToolUse:Edit|Write. Tracks edited files + runs opt-in formatter commands (deduped per file). Config: `edit_gate.commands`.
 - `loop-gate.js` — PreToolUse:Bash|Edit|Write. Blocks 3rd consecutive identical call.
 - `gate-block.js` — PreToolUse (no matcher = all tools). Blocks non-read tools when gate is active/revise/fix. Allows Read/Glob/Grep and spawning correct agent.
-- `stop-gate.js` — Stop. Artifact completeness + configurable debug scan + custom commands. Default mode: warn (stderr only).
+- `stop-gate.js` — Stop. Artifact completeness + configurable debug scan + custom commands + commit nudge. Default mode: warn (stderr only).
 
 ## Testing
 

@@ -14,7 +14,7 @@ Set up claude-gates for the current project. Detect the project's stack, suggest
 3. **Propose `claude-gates.json`.** Based on the detected stack, suggest:
    - **commit_gate**: enable if tests/lint exist. Use the project's actual test and lint commands.
    - **stop_gate**: set patterns appropriate to the language (`console.log` for JS/TS, `print(` for Python, `fmt.Println` for Go, `Debug.Log` for C#). Add build command if applicable. Suggest `warn` mode (safe default).
-   - **edit_gate**: keep defaults (10 files / 200 lines) unless the project is unusually large.
+   - **edit_gate**: detect formatters based on project stack. Suggest `commands` appropriate to the language/tools found.
 
 4. **Ask the user** to confirm or adjust each gate's settings. Present as a short checklist — not a wall of text. Example:
 
@@ -29,11 +29,24 @@ Set up claude-gates for the current project. Detect the project's stack, suggest
      patterns: ["TODO", "HACK", "FIXME", "console.log"]
      mode: warn
 
-   Edit gate:
-     10 files / 200 lines (defaults)
+   Edit gate (format-on-save):
+     commands: ["npx prettier --write {file}"]
 
-   Create claude-gates.json with these settings? (adjust any)
+     {file} is replaced with each edited file's path.
+     Runs once per file (deduped). Enable? (y/adjust/skip)
    ```
+
+   **Edit gate detection by stack:**
+
+   | Stack | Suggested commands |
+   |-------|-------------------|
+   | .NET (`*.csproj`) | `["dotnet format --include {file}"]` |
+   | Node/TS (`package.json` with prettier) | `["npx prettier --write {file}"]` |
+   | Python (`pyproject.toml` with ruff) | `["ruff format {file}"]` |
+   | Python (`pyproject.toml` with black) | `["black {file}"]` |
+   | Go (`go.mod`) | `["gofmt -w {file}"]` |
+   | Rust (`Cargo.toml`) | `["rustfmt {file}"]` |
+   | None detected | `[]` (empty, explain opt-in) |
 
 5. **Write `claude-gates.json`** with confirmed settings.
 

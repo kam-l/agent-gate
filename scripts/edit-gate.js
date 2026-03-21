@@ -2,11 +2,14 @@
 /**
  * ClaudeGates v2 — PostToolUse:Edit|Write gate.
  *
- * Tracks edited files and nudges when uncommitted changes exceed thresholds.
- * Never blocks — stderr nudge only.
+ * Tracks edited files in SQLite (stop-gate reads them).
+ * Runs opt-in formatter commands on each newly-edited file (deduped).
  *
- * Thresholds configurable via claude-gates.json (defaults: 10 files, 200 lines).
- * Git stats computed lazily every 5th unique file (not on every edit).
+ * Config (claude-gates.json):
+ *   edit_gate.commands: ["dotnet format --include {file}"]
+ *   {file} is replaced with the absolute path of the just-edited file.
+ *   Commands run only on NEW files (dedup — same file edited twice doesn't re-run).
+ *   Failures are non-fatal (stderr warning, never blocks).
  *
  * Fail-open.
  */
@@ -14,13 +17,8 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { getDb, addEdit, getEdits, getEditCounts } = require("./claude-gates-db.js");
+const { getDb, addEdit, getEdits } = require("./claude-gates-db.js");
 const { loadConfig } = require("./claude-gates-config.js");
-
-const config = loadConfig();
-const FILE_THRESHOLD = config.edit_gate.file_threshold;
-const LINE_THRESHOLD = config.edit_gate.line_threshold;
-const CHECK_INTERVAL = 5; // compute git stats every Nth unique file
 
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -46,7 +44,7 @@ try {
   // Normalize path (resolve + forward slashes)
   const normalized = path.resolve(filePath).replace(/\\/g, "/");
 
-  // SQLite: track edits and check thresholds
+  // SQLite: track edits
   const db = getDb(sessionDir);
 
   // Check if this is a new file (not already tracked)
@@ -56,48 +54,28 @@ try {
   // Track the file
   addEdit(db, normalized);
 
+  // Run formatter commands on new files only (dedup)
   if (isNew) {
-    const counts = getEditCounts(db);
+    const config = loadConfig();
+    const commands = config.edit_gate.commands || [];
 
-    // Lazy git stats: compute every CHECK_INTERVAL unique files
-    if (counts.files % CHECK_INTERVAL === 0) {
+    for (const cmd of commands) {
+      const expanded = cmd.replace(/\{file\}/g, normalized);
       try {
-        const stat = execSync("git diff --numstat", {
+        execSync(expanded, {
           encoding: "utf-8",
-          timeout: 5000,
+          timeout: 30000,
           stdio: ["pipe", "pipe", "pipe"]
         });
-
-        // Reset all line counts
-        db.prepare("UPDATE edits SET lines = 0").run();
-
-        // Parse per-file stats: additions\tdeletions\tfilepath
-        const diffLines = stat.trim().split("\n").filter(Boolean);
-        for (const line of diffLines) {
-          const parts = line.split("\t");
-          if (parts.length >= 3) {
-            const add = parseInt(parts[0], 10) || 0;
-            const del = parseInt(parts[1], 10) || 0;
-            const absPath = path.resolve(parts.slice(2).join("\t")).replace(/\\/g, "/");
-            addEdit(db, absPath, add + del);
-          }
+      } catch (err) {
+        // Non-fatal — show stderr output to user
+        const output = (err.stderr || "").trim();
+        if (output) {
+          process.stderr.write(`[ClaudeGates] Formatter: ${output}\n`);
+        } else {
+          process.stderr.write(`[ClaudeGates] Formatter failed: ${expanded}\n`);
         }
-
-        // If git shows no changes, everything was committed
-        if (diffLines.length === 0) {
-          db.prepare("DELETE FROM edits").run();
-        }
-      } catch {} // git unavailable — skip stats
-    }
-
-    // Check thresholds using derived counts
-    const finalCounts = getEditCounts(db);
-
-    if (finalCounts.files >= FILE_THRESHOLD || finalCounts.lines >= LINE_THRESHOLD) {
-      const parts = [];
-      if (finalCounts.files >= FILE_THRESHOLD) parts.push(`${finalCounts.files} files`);
-      if (finalCounts.lines >= LINE_THRESHOLD) parts.push(`${finalCounts.lines} lines`);
-      process.stderr.write(`[ClaudeGates] ${parts.join(" / ")} changed without commit. Consider committing.\n`);
+      }
     }
   }
 

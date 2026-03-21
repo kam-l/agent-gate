@@ -17,7 +17,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { getDb, getEdits, isCleared, registerAgent } = require("./claude-gates-db.js");
+const { getDb, getEdits, getEditCounts, isCleared, registerAgent } = require("./claude-gates-db.js");
 const { loadConfig } = require("./claude-gates-config.js");
 
 try {
@@ -124,6 +124,21 @@ try {
       issues.push(`  Command failed: ${cmd}${output ? " — " + output : ""}`);
     }
   }
+
+  // ── Commit nudge: uncommitted tracked files ──
+  try {
+    const counts = getEditCounts(db);
+    if (counts.files > 0) {
+      const status = execSync("git status --porcelain", {
+        encoding: "utf-8",
+        timeout: 5000,
+        stdio: ["pipe", "pipe", "pipe"]
+      }).trim();
+      if (status) {
+        issues.push(`  ${counts.files} files changed without commit. Consider committing.`);
+      }
+    }
+  } catch {} // git unavailable — skip
 
   if (matches.length === 0 && issues.length === 0) {
     db.close();

@@ -96,9 +96,9 @@ After verification, `session_scopes.json` stores structured verdict objects:
 | `claude-gates-verification.js` | SubagentStop | Structural + semantic validation on stop |
 | `plan-gate.js` | PreToolUse:ExitPlanMode | Verdict-based: checks for gater PASS in session_scopes |
 | `commit-gate.js` | PreToolUse:Bash | Pre-commit validation (opt-in via `claude-gates.json`) |
-| `edit-gate.js` | PostToolUse:Edit\|Write | Tracks edited files, configurable thresholds |
+| `edit-gate.js` | PostToolUse:Edit\|Write | Tracks edited files, runs opt-in formatters |
 | `loop-gate.js` | PreToolUse:Bash\|Edit\|Write | Breaks infinite loops of identical tool calls |
-| `stop-gate.js` | Stop | Configurable debug scan + custom commands |
+| `stop-gate.js` | Stop | Configurable debug scan + custom commands + commit nudge |
 
 ## Troubleshooting
 

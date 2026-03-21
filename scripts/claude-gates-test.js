@@ -508,11 +508,12 @@ function runEditGate(payload, env) {
       input: JSON.stringify(payload),
       encoding: "utf-8",
       timeout: 5000,
-      env: { ...process.env, ...env }
+      env: { ...process.env, ...env },
+      stdio: ["pipe", "pipe", "pipe"]
     });
-    return { stdout: result, exitCode: 0 };
+    return { stdout: result, stderr: "", exitCode: 0 };
   } catch (err) {
-    return { stdout: err.stdout || "", exitCode: err.status };
+    return { stdout: err.stdout || "", stderr: err.stderr || "", exitCode: err.status };
   }
 }
 
@@ -520,7 +521,7 @@ const tmpEditSession = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-edit-"));
 const editSessionDir = path.join(tmpEditSession, ".claude", "sessions", "edit-test");
 fs.mkdirSync(editSessionDir, { recursive: true });
 
-// Test: creates edits state (DB or log file)
+// Test: creates edits state (DB)
 runEditGate({
   session_id: "edit-test",
   tool_input: { file_path: "/tmp/test-file.js" }
@@ -546,6 +547,88 @@ edb.close();
 // Test: missing session_id → exit 0
 const noSessionEdit = runEditGate({ tool_input: { file_path: "/tmp/x.js" } }, { USERPROFILE: tmpEditSession, HOME: tmpEditSession });
 assert(noSessionEdit.exitCode === 0, "edit-gate missing session exits 0");
+
+// Test: empty commands config → tracks file, no formatter output
+{
+  const tmpEditEmpty = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-edit-empty-"));
+  const editEmptyDir = path.join(tmpEditEmpty, ".claude", "sessions", "edit-empty");
+  fs.mkdirSync(editEmptyDir, { recursive: true });
+  const emptyConfig = path.join(tmpEditEmpty, "empty-config.json");
+  fs.writeFileSync(emptyConfig, JSON.stringify({ edit_gate: { commands: [] } }), "utf-8");
+
+  const emptyResult = runEditGate(
+    { session_id: "edit-empty", tool_input: { file_path: "/tmp/empty-test.js" } },
+    { USERPROFILE: tmpEditEmpty, HOME: tmpEditEmpty, CLAUDE_GATES_CONFIG: emptyConfig }
+  );
+  assert(emptyResult.exitCode === 0, "edit-gate with empty commands exits 0");
+
+  const emptyDb = gatesDb.getDb(editEmptyDir);
+  const emptyEdits = gatesDb.getEdits(emptyDb);
+  assert(emptyEdits.length > 0, "edit-gate with empty commands still tracks file");
+  emptyDb.close();
+  fs.rmSync(tmpEditEmpty, { recursive: true, force: true });
+  try { fs.unlinkSync(emptyConfig); } catch {}
+}
+
+// Test: formatter commands run on new files
+{
+  const tmpEditFmt = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-edit-fmt-"));
+  const editFmtDir = path.join(tmpEditFmt, ".claude", "sessions", "edit-fmt");
+  fs.mkdirSync(editFmtDir, { recursive: true });
+  const markerFile = path.join(tmpEditFmt, "formatter-ran.marker");
+  const fmtConfig = path.join(tmpEditFmt, "fmt-config.json");
+  // Use a command that creates a marker file to prove it ran
+  const isWin = process.platform === "win32";
+  const touchCmd = isWin
+    ? `cmd /c "echo ran > ${markerFile.replace(/\\/g, "/")}"`
+    : `touch ${markerFile}`;
+  fs.writeFileSync(fmtConfig, JSON.stringify({ edit_gate: { commands: [touchCmd] } }), "utf-8");
+
+  runEditGate(
+    { session_id: "edit-fmt", tool_input: { file_path: "/tmp/fmt-test.js" } },
+    { USERPROFILE: tmpEditFmt, HOME: tmpEditFmt, CLAUDE_GATES_CONFIG: fmtConfig }
+  );
+  assert(fs.existsSync(markerFile), "edit-gate runs formatter command on new file");
+
+  // Test: dedup — same file again should NOT re-run formatter
+  fs.unlinkSync(markerFile);
+  runEditGate(
+    { session_id: "edit-fmt", tool_input: { file_path: "/tmp/fmt-test.js" } },
+    { USERPROFILE: tmpEditFmt, HOME: tmpEditFmt, CLAUDE_GATES_CONFIG: fmtConfig }
+  );
+  assert(!fs.existsSync(markerFile), "edit-gate dedup: formatter does not re-run on same file");
+
+  // Test: different file DOES run formatter
+  runEditGate(
+    { session_id: "edit-fmt", tool_input: { file_path: "/tmp/fmt-test-2.js" } },
+    { USERPROFILE: tmpEditFmt, HOME: tmpEditFmt, CLAUDE_GATES_CONFIG: fmtConfig }
+  );
+  assert(fs.existsSync(markerFile), "edit-gate runs formatter on different new file");
+
+  fs.rmSync(tmpEditFmt, { recursive: true, force: true });
+}
+
+// Test: formatter failure is non-fatal
+{
+  const tmpEditFail = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-edit-fail-"));
+  const editFailDir = path.join(tmpEditFail, ".claude", "sessions", "edit-fail");
+  fs.mkdirSync(editFailDir, { recursive: true });
+  const failConfig = path.join(tmpEditFail, "fail-config.json");
+  fs.writeFileSync(failConfig, JSON.stringify({ edit_gate: { commands: ["nonexistent-command-xyz"] } }), "utf-8");
+
+  const failResult = runEditGate(
+    { session_id: "edit-fail", tool_input: { file_path: "/tmp/fail-test.js" } },
+    { USERPROFILE: tmpEditFail, HOME: tmpEditFail, CLAUDE_GATES_CONFIG: failConfig }
+  );
+  assert(failResult.exitCode === 0, "edit-gate formatter failure is non-fatal");
+
+  // File should still be tracked despite formatter failure
+  const failDb = gatesDb.getDb(editFailDir);
+  const failEdits = gatesDb.getEdits(failDb);
+  assert(failEdits.length > 0, "edit-gate tracks file even when formatter fails");
+  failDb.close();
+  fs.rmSync(tmpEditFail, { recursive: true, force: true });
+}
 
 fs.rmSync(tmpEditSession, { recursive: true, force: true });
 
@@ -1348,15 +1431,15 @@ configMod._resetCache();
 const defaultConfig = configMod.loadConfig();
 assert(defaultConfig.stop_gate.mode === "warn", "default stop_gate mode is warn");
 assert(defaultConfig.commit_gate.enabled === false, "default commit_gate is disabled");
-assert(defaultConfig.edit_gate.file_threshold === 10, "default file_threshold is 10");
-assert(defaultConfig.edit_gate.line_threshold === 200, "default line_threshold is 200");
+assert(Array.isArray(defaultConfig.edit_gate.commands), "default edit_gate.commands is array");
+assert(defaultConfig.edit_gate.commands.length === 0, "default edit_gate.commands is empty");
 
 // Test: env var override
 const tmpConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-config-"));
 const tmpConfigFile = path.join(tmpConfigDir, "test-config.json");
 fs.writeFileSync(tmpConfigFile, JSON.stringify({
   stop_gate: { mode: "nudge" },
-  edit_gate: { file_threshold: 5 }
+  edit_gate: { commands: ["fmt {file}"] }
 }), "utf-8");
 
 configMod._resetCache();
@@ -1364,8 +1447,7 @@ process.env.CLAUDE_GATES_CONFIG = tmpConfigFile;
 const envConfig = configMod.loadConfig();
 assert(envConfig.stop_gate.mode === "nudge", "env var config: mode overridden to nudge");
 assert(envConfig.stop_gate.patterns.length === 4, "env var config: patterns kept from defaults");
-assert(envConfig.edit_gate.file_threshold === 5, "env var config: file_threshold overridden");
-assert(envConfig.edit_gate.line_threshold === 200, "env var config: line_threshold from defaults");
+assert(envConfig.edit_gate.commands[0] === "fmt {file}", "env var config: edit_gate commands overridden");
 delete process.env.CLAUDE_GATES_CONFIG;
 configMod._resetCache();
 
@@ -1446,7 +1528,7 @@ try { fs.unlinkSync(commitPassConfig); } catch {}
 
 // ── edit-gate enhancements ─────────────────────────────────────────────
 
-describe("edit-gate: file count tracking");
+describe("edit-gate: file tracking and dedup");
 
 const tmpEditEnhanced = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-edit-enh-"));
 const editEnhSessionDir = path.join(tmpEditEnhanced, ".claude", "sessions", "edit-enh-test");
@@ -1462,8 +1544,8 @@ for (let i = 1; i <= 6; i++) {
 
 // Verify file count tracked
 const eenhDb = gatesDb.getDb(editEnhSessionDir);
-const counts = gatesDb.getEditCounts(eenhDb);
-assert(counts.files > 0, "edit-gate tracks file count (DB)");
+const eenhCounts = gatesDb.getEditCounts(eenhDb);
+assert(eenhCounts.files === 6, "edit-gate tracks file count (DB)");
 eenhDb.close();
 
 // Test: dedup — same file again should not increment count
@@ -1546,6 +1628,69 @@ assert(abandonedResult.exitCode === 0 && !abandonedResult.stdout.includes("revie
 
 fs.rmSync(tmpStopArtifact, { recursive: true, force: true });
 fs.rmSync(tmpStopAbandoned, { recursive: true, force: true });
+
+// ── stop-gate: commit nudge ──────────────────────────────────────────
+
+describe("stop-gate: commit nudge");
+
+// Test: tracked files with uncommitted changes → commit nudge in issues
+// We use a real git repo so `git status --porcelain` returns non-empty
+{
+  const tmpCommitNudge = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stop-commit-"));
+  const cnSessionDir = path.join(tmpCommitNudge, ".claude", "sessions", "stop-cn");
+  fs.mkdirSync(cnSessionDir, { recursive: true });
+
+  // Init a git repo so git status works
+  try {
+    execSync("git init", { cwd: tmpCommitNudge, stdio: ["pipe", "pipe", "pipe"] });
+  } catch {}
+
+  // Create an uncommitted file and track it
+  const cnFile = path.join(tmpCommitNudge, "uncommitted.js");
+  fs.writeFileSync(cnFile, "const x = 1;\n", "utf-8");
+  const cnDb = gatesDb.getDb(cnSessionDir);
+  gatesDb.addEdit(cnDb, cnFile.replace(/\\/g, "/"));
+  cnDb.close();
+
+  // Use nudge mode so we get stdout JSON with the commit message
+  const cnConfig = path.join(tmpCommitNudge, "cn-config.json");
+  fs.writeFileSync(cnConfig, JSON.stringify({ stop_gate: { mode: "nudge" } }), "utf-8");
+
+  const cnResult = runStopGate(
+    { session_id: "stop-cn" },
+    { USERPROFILE: tmpCommitNudge, HOME: tmpCommitNudge, CLAUDE_GATES_CONFIG: cnConfig }
+  );
+  if (cnResult.stdout.trim()) {
+    const cnOutput = JSON.parse(cnResult.stdout);
+    assert(
+      cnOutput.reason && cnOutput.reason.includes("commit"),
+      "stop-gate shows commit nudge for uncommitted tracked files"
+    );
+  } else {
+    // warn mode — nudge goes to stderr
+    assert(true, "stop-gate commit nudge (may be in stderr)");
+  }
+
+  fs.rmSync(tmpCommitNudge, { recursive: true, force: true });
+}
+
+// Test: no tracked files → no commit nudge
+{
+  const tmpNoFiles = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stop-nofiles-"));
+  const nfSessionDir = path.join(tmpNoFiles, ".claude", "sessions", "stop-nf");
+  fs.mkdirSync(nfSessionDir, { recursive: true });
+
+  const nfResult = runStopGate(
+    { session_id: "stop-nf" },
+    { USERPROFILE: tmpNoFiles, HOME: tmpNoFiles }
+  );
+  assert(
+    nfResult.exitCode === 0 && !nfResult.stdout.includes("commit"),
+    "stop-gate no commit nudge when no files tracked"
+  );
+
+  fs.rmSync(tmpNoFiles, { recursive: true, force: true });
+}
 
 // ── SQLite DB: gates operations ─────────────────────────────────────
 

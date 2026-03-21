@@ -5,7 +5,7 @@ Quality gates for Claude Code agents. Your agents shall not pass without earning
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-plugin-blueviolet)](https://code.claude.com/docs/en/plugins)
 [![Tests: 287 passing](https://img.shields.io/badge/tests-287_passing-green)]()
-[![Version: 2.6.0](https://img.shields.io/badge/version-2.6.0-blue)]()
+[![Version: 2.7.0](https://img.shields.io/badge/version-2.7.0-blue)]()
 
 <p align="center">
   <img src="gandalf.png" alt="You shall not pass!" width="400">
@@ -153,22 +153,21 @@ No configuration needed — works automatically. To verify a plan, spawn `claude
 
 **When:** After every file edit (PostToolUse:Edit|Write)
 
-**Why:** Large uncommitted changesets are risky. A nudge at the right moment prevents sprawling diffs.
+**Why:** Formatting should happen automatically when files change, not as a manual step. The edit gate tracks every edited file and runs opt-in formatter commands on each new file (deduped — same file edited twice runs formatters once).
 
-**How it works:** Tracks edited files and computes git diff stats. When thresholds are exceeded, prints a stderr reminder to commit.
+**How it works:** Tracks edited files in SQLite (stop-gate reads this for commit nudging). If `edit_gate.commands` is configured, runs each command with `{file}` replaced by the edited file's absolute path. Failures are non-fatal (stderr warning, never blocks).
 
-**Default: 10 files or 200 lines.** Configure in `claude-gates.json`:
+**Default: no formatters (opt-in).** Configure in `claude-gates.json`:
 
 ```json
 {
   "edit_gate": {
-    "file_threshold": 15,
-    "line_threshold": 300
+    "commands": ["dotnet format --include {file}"]
   }
 }
 ```
 
-Never blocks — stderr nudge only.
+Run `/claude-gates:setup` to auto-detect formatters for your stack.
 
 ---
 
@@ -190,7 +189,7 @@ No configuration — always active.
 
 **Why:** Debug leftovers ship to production. `console.log`, `TODO`, `HACK` — patterns that belong in development, not in committed code.
 
-**How it works:** Scans all files edited during the session for configurable patterns. Two modes: **warn** (stderr, default) or **nudge** (blocks once, second stop passes).
+**How it works:** Scans all files edited during the session for configurable patterns. Also nudges if tracked files have uncommitted changes. Two modes: **warn** (stderr, default) or **nudge** (blocks once, second stop passes).
 
 **Default patterns:** `TODO`, `HACK`, `FIXME`, `console.log`. Configure in `claude-gates.json`:
 
@@ -226,8 +225,7 @@ Missing fields use defaults. No config file = built-in defaults. All gates work 
     "enabled": false
   },
   "edit_gate": {
-    "file_threshold": 10,
-    "line_threshold": 200
+    "commands": []
   }
 }
 ```
