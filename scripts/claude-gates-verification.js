@@ -381,7 +381,7 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
   const verdictObj = recordVerdict(resolvedSessionDir, scope, agentType, finalVerdict, db);
 
   if (verdictObj) {
-    process.stderr.write(`[ClaudeGates] Verdict: ${finalVerdict} (round ${verdictObj.round}).\n`);
+    process.stderr.write(`[ClaudeGates] Verdict: ${finalVerdict}.\n`);
   }
 
   // Only FAIL blocks; REVISE/CONVERGED/PASS/UNKNOWN allow
@@ -461,16 +461,16 @@ function processGateTransitions(db, scope, agentType, finalVerdict, mdContent) {
           // Fixer defined — route to fixer instead of source
           const result = gatesDb.fixGate(db, scope, activeGate.order);
           if (result && result.status === "failed") {
-            process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} exhausted max rounds (${activeGate.max_rounds}). Scope "${scope}" gate chain FAILED.\n`);
+            process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} exhausted rounds. Scope "${scope}" gate chain FAILED.\n`);
           } else if (result) {
-            process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} returned REVISE (round ${result.round}/${activeGate.max_rounds}). Spawn fixer "${activeGate.fixer_agent}" with scope=${scope}.\n`);
+            process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} returned REVISE. Spawn fixer "${activeGate.fixer_agent}" with scope=${scope}.\n`);
           }
         } else {
           const result = gatesDb.reviseGate(db, scope, activeGate.order);
           if (result && result.status === "failed") {
-            process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} exhausted max rounds (${activeGate.max_rounds}). Scope "${scope}" gate chain FAILED.\n`);
+            process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} exhausted rounds. Scope "${scope}" gate chain FAILED.\n`);
           } else if (result) {
-            process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} returned REVISE (round ${result.round}/${activeGate.max_rounds}). Resume source agent "${activeGate.source_agent}" with scope=${scope}.\n`);
+            process.stderr.write(`[ClaudeGates] Gate ${activeGate.gate_agent} returned REVISE. Resume source agent "${activeGate.source_agent}" with scope=${scope}.\n`);
           }
         }
       }

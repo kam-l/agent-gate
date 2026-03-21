@@ -148,7 +148,7 @@ try {
     if (activeGate && agentType !== activeGate.gate_agent) {
       process.stdout.write(JSON.stringify({
         decision: "block",
-        reason: `[ClaudeGates] Scope "${scope}" has active gate: ${activeGate.gate_agent} (round ${activeGate.round}/${activeGate.max_rounds}). Spawn ${activeGate.gate_agent} with scope=${scope}.`
+        reason: `[ClaudeGates] Scope "${scope}" has active gate: ${activeGate.gate_agent}. Spawn ${activeGate.gate_agent} with scope=${scope}.`
       }));
       db.close();
       process.exit(0);

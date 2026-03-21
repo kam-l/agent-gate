@@ -90,7 +90,7 @@ try {
     if (attempts >= MAX_ATTEMPTS) {
       resetAttempts(db2, "_system", "plan-gate");
       db2.close();
-      process.stderr.write(`[ClaudeGates] Plan gate auto-allowed after ${MAX_ATTEMPTS} verification attempts.\n`);
+      process.stderr.write(`[ClaudeGates] Plan gate safety valve activated.\n`);
       process.exit(0);
     }
     db2.close();
@@ -103,7 +103,7 @@ try {
     fs.writeFileSync(attemptsFile, String(attempts), "utf-8");
     if (attempts >= MAX_ATTEMPTS) {
       fs.writeFileSync(attemptsFile, "0", "utf-8");
-      process.stderr.write(`[ClaudeGates] Plan gate auto-allowed after ${MAX_ATTEMPTS} verification attempts.\n`);
+      process.stderr.write(`[ClaudeGates] Plan gate safety valve activated.\n`);
       process.exit(0);
     }
   }

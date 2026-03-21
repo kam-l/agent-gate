@@ -46,7 +46,7 @@ try {
       db.close();
       process.stdout.write(JSON.stringify({
         decision: "block",
-        reason: `[ClaudeGates] Blocked: identical ${toolName} call made 3 times consecutively. Change your approach.`
+        reason: `[ClaudeGates] Blocked: identical ${toolName} call repeated consecutively. Change your approach.`
       }));
       process.exit(0);
     }
@@ -71,7 +71,7 @@ try {
         history[history.length - 2] === hash) {
       process.stdout.write(JSON.stringify({
         decision: "block",
-        reason: `[ClaudeGates] Blocked: identical ${toolName} call made 3 times consecutively. Change your approach.`
+        reason: `[ClaudeGates] Blocked: identical ${toolName} call repeated consecutively. Change your approach.`
       }));
       process.exit(0);
     }
