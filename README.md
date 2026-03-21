@@ -12,6 +12,57 @@ Quality gates for Claude Code agents. Your agents shall not pass without earning
   <img src="gandalf.png" alt="You shall not pass!" width="400">
 </p>
 
+## Why This Exists
+
+I tried the popular Claude Code harnesses. They're ceremony — elaborate prompts, naming conventions, folder structures — and zero enforcement. Your agent can ignore every "rule" because nothing actually stops it.
+
+Then I tried prompt engineering my own subagents. Wrote aggressive instructions. Added context. Bolded the requirements. Agents still skipped creating their output files. Not sometimes — regularly.
+
+**Prompts are suggestions. Hooks are enforcement.**
+
+claude-gates moves quality control from "please do this" to "you literally cannot proceed without doing this." Every gate is a hook that fires at a deterministic moment in the agent lifecycle. No amount of prompt-following variance can bypass a `PreToolUse` block.
+
+## Gate Lifecycle
+
+Every agent spawn passes through a deterministic pipeline. Gates fire at hook boundaries — not prompt-level, hook-level.
+
+```mermaid
+flowchart TD
+    A([Agent spawn requested]) --> B{conditions:}
+    B -->|FAIL| Z[⛔ Blocked]
+    B -->|PASS / none| C{requires:}
+    C -->|missing artifact| Z
+    C -->|satisfied| D[SubagentStart · inject output path]
+    D --> E([Agent executes])
+    E --> F{verification:}
+    F -->|structural fail| G[REVISE → agent rewrites]
+    F -->|semantic fail| G
+    G --> E
+    F -->|PASS| H{gates: chain?}
+    H -->|none| K([✅ Complete])
+    H -->|has gates| I[Gate agent reviews]
+    I -->|PASS| J{next gate?}
+    J -->|yes| I
+    J -->|no| K
+    I -->|REVISE| L[Source / fixer rewrites]
+    L --> I
+    I -->|max rounds| Z
+
+    style Z fill:#d32f2f,color:#fff
+    style K fill:#388e3c,color:#fff
+    style E fill:#1565c0,color:#fff
+```
+
+Session-level gates run independently of the agent pipeline:
+
+| Gate | Fires at | Purpose |
+|------|----------|---------|
+| **Plan** | `ExitPlanMode` | Block unreviewed plans |
+| **Edit** | `Edit` · `Write` | Auto-format on save |
+| **Commit** | `Bash` (git commit) | Run tests before commit |
+| **Loop** | `Bash` · `Edit` · `Write` | Kill 3× identical calls |
+| **Stop** | session end | Catch debug leftovers |
+
 ## Install
 
 ```bash
