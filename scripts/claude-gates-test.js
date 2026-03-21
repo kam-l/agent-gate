@@ -2063,6 +2063,36 @@ if (gblockDb) {
   assert(editResult.stdout.includes("block"),
     "active gate + Edit → blocked");
 
+  // Active gate + agent_type=reviewer (gate agent calling) → allowed
+  const gateAgentSelf = runGateBlock({
+    session_id: "gblock-test",
+    tool_name: "Write",
+    tool_input: { file_path: "/tmp/artifact.md" },
+    agent_type: "reviewer"
+  }, { USERPROFILE: tmpGateBlock, HOME: tmpGateBlock });
+  assert(gateAgentSelf.exitCode === 0 && !gateAgentSelf.stdout.includes("block"),
+    "active gate + agent_type=gate_agent → allowed");
+
+  // Active gate + plugin-qualified agent_type → allowed
+  const qualifiedSelf = runGateBlock({
+    session_id: "gblock-test",
+    tool_name: "Bash",
+    tool_input: { command: "echo test" },
+    agent_type: "my-plugin:reviewer"
+  }, { USERPROFILE: tmpGateBlock, HOME: tmpGateBlock });
+  assert(qualifiedSelf.exitCode === 0 && !qualifiedSelf.stdout.includes("block"),
+    "active gate + plugin-qualified agent_type → allowed");
+
+  // Active gate + wrong agent_type → blocked
+  const wrongCaller = runGateBlock({
+    session_id: "gblock-test",
+    tool_name: "Write",
+    tool_input: { file_path: "/tmp/foo.js" },
+    agent_type: "implementer"
+  }, { USERPROFILE: tmpGateBlock, HOME: tmpGateBlock });
+  assert(wrongCaller.stdout.includes("block"),
+    "active gate + wrong agent_type → blocked");
+
   // Active gate + MCP tool → blocked
   const mcpResult = runGateBlock({
     session_id: "gblock-test",
