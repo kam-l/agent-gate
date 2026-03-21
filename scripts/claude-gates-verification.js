@@ -352,7 +352,7 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
   try {
     // Pipe prompt via stdin — eliminates shell injection and temp files
     result = execSync(
-      "claude -p --model sonnet --agent claude-gates:gater --max-turns 1 --tools \"\"",
+      "claude -p --model sonnet --agent claude-gates:gater --max-turns 1 --tools \"\" --no-chrome",
       {
         input: combinedPrompt,
         cwd: PROJECT_ROOT,
