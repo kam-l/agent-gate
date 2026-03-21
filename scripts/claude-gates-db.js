@@ -42,12 +42,30 @@ const path = require("path");
 let Database;
 try {
   Database = require("better-sqlite3");
-} catch (e) {
-  process.stderr.write(
-    `[ClaudeGates] FATAL: better-sqlite3 not found. Run "npm install" in the plugin directory.\n` +
-    `  Plugin path: ${__dirname.replace(/[\\/]scripts$/, "")}\n`
-  );
-  throw e;
+} catch {
+  // Local node_modules missing — try sibling version directories.
+  // Plugin cache layout: .../claude-gates/<version>/node_modules/
+  const pluginDir = __dirname.replace(/[\\/]scripts$/, "");
+  const parentDir = path.dirname(pluginDir);
+  let found = false;
+  try {
+    for (const sibling of fs.readdirSync(parentDir)) {
+      if (sibling === path.basename(pluginDir)) continue;
+      const candidate = path.join(parentDir, sibling, "node_modules", "better-sqlite3");
+      try {
+        Database = require(candidate);
+        found = true;
+        break;
+      } catch {}
+    }
+  } catch {}
+  if (!found) {
+    process.stderr.write(
+      `[ClaudeGates] FATAL: better-sqlite3 not found. Run "npm install" in the plugin directory.\n` +
+      `  Plugin path: ${pluginDir}\n`
+    );
+    throw new Error("better-sqlite3 not found");
+  }
 }
 
 const SCHEMA_SQL = `
