@@ -768,9 +768,9 @@ assert(deletedResult.exitCode === 0 && !deletedResult.stdout.includes("block"), 
 fs.rmSync(tmpStopSession, { recursive: true, force: true });
 fs.rmSync(deletedStopSession, { recursive: true, force: true });
 
-// ── StopFailure: gate reset on API error ─────────────────────────────
+// ── StopFailure: deletes orphaned gates on API error ─────────────────
 
-describe("StopFailure: resets active gates to pending");
+describe("StopFailure: deletes active gates for clean retry");
 
 const tmpFailSession = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stopfail-"));
 const failSessionDir = path.join(tmpFailSession, ".claude", "sessions", "stop-fail");
@@ -782,26 +782,86 @@ gatesDb.registerAgent(failDb, "test-scope", "test-worker", null);
 gatesDb.initGates(failDb, "test-scope", "test-worker", [
   { agent: "gt-reviewer", maxRounds: 3, fixer: null }
 ]);
-const activeGate = gatesDb.getActiveGate(failDb, "test-scope");
-assert(activeGate && activeGate.status === "active", "gate starts active");
+assert(gatesDb.getActiveGate(failDb, "test-scope"), "gate starts active");
 failDb.close();
 
-// Send StopFailure payload (has error field)
 const stopFailResult = runStopGate(
   { session_id: "stop-fail", error: "rate_limit", error_details: "429 Too Many Requests" },
   { USERPROFILE: tmpFailSession, HOME: tmpFailSession }
 );
 assert(stopFailResult.exitCode === 0, "StopFailure exits 0");
 
-// Verify gate was reset to pending
+// Gates should be deleted (not just reset) so initGates can recreate on retry
 const failDb2 = gatesDb.getDb(failSessionDir);
-const resetGate = gatesDb.getActiveGate(failDb2, "test-scope");
-assert(!resetGate, "StopFailure: no active gate after reset");
-const allGates = gatesDb.getGates(failDb2, "test-scope");
-assert(allGates.length === 1 && allGates[0].status === "pending", "StopFailure: gate reset to pending");
+assert(!gatesDb.getActiveGate(failDb2, "test-scope"), "StopFailure: no active gate");
+assert(gatesDb.getGates(failDb2, "test-scope").length === 0, "StopFailure: gates deleted, not just reset");
+
+// Verify initGates can recreate after deletion (the whole point)
+gatesDb.initGates(failDb2, "test-scope", "test-worker", [
+  { agent: "gt-reviewer", maxRounds: 3, fixer: null }
+]);
+const reinitGate = gatesDb.getActiveGate(failDb2, "test-scope");
+assert(reinitGate && reinitGate.status === "active", "StopFailure: initGates works after deletion");
 failDb2.close();
 
 fs.rmSync(tmpFailSession, { recursive: true, force: true });
+
+// Test: StopFailure with gates in 'revise' and 'fix' status
+describe("StopFailure: deletes revise/fix gates too");
+
+const tmpFailSession2 = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stopfail2-"));
+const failSessionDir2 = path.join(tmpFailSession2, ".claude", "sessions", "stop-fail2");
+fs.mkdirSync(failSessionDir2, { recursive: true });
+
+const failDb3 = gatesDb.getDb(failSessionDir2);
+gatesDb.registerAgent(failDb3, "scope-r", "worker", null);
+gatesDb.initGates(failDb3, "scope-r", "worker", [
+  { agent: "reviewer", maxRounds: 3, fixer: "fixer" },
+  { agent: "auditor", maxRounds: 2, fixer: null }
+]);
+// Move first gate to 'revise'
+gatesDb.reviseGate(failDb3, "scope-r", 0);
+const revGate = gatesDb.getReviseGate(failDb3, "scope-r");
+assert(revGate && revGate.status === "revise", "gate is in revise state");
+failDb3.close();
+
+const stopFailResult2 = runStopGate(
+  { session_id: "stop-fail2", error: "server_error" },
+  { USERPROFILE: tmpFailSession2, HOME: tmpFailSession2 }
+);
+assert(stopFailResult2.exitCode === 0, "StopFailure exits 0 (revise case)");
+
+const failDb4 = gatesDb.getDb(failSessionDir2);
+assert(gatesDb.getGates(failDb4, "scope-r").length === 0, "StopFailure: revise gates deleted");
+failDb4.close();
+
+fs.rmSync(tmpFailSession2, { recursive: true, force: true });
+
+// Test: normal Stop (no error field) does NOT delete gates
+describe("StopFailure: normal Stop leaves gates intact");
+
+const tmpNormalStop = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-normalstop-"));
+const normalStopDir = path.join(tmpNormalStop, ".claude", "sessions", "stop-normal");
+fs.mkdirSync(normalStopDir, { recursive: true });
+
+const nsDb = gatesDb.getDb(normalStopDir);
+gatesDb.registerAgent(nsDb, "ns-scope", "worker", null);
+gatesDb.initGates(nsDb, "ns-scope", "worker", [
+  { agent: "reviewer", maxRounds: 3, fixer: null }
+]);
+nsDb.close();
+
+runStopGate(
+  { session_id: "stop-normal" },
+  { USERPROFILE: tmpNormalStop, HOME: tmpNormalStop }
+);
+
+const nsDb2 = gatesDb.getDb(normalStopDir);
+assert(gatesDb.getGates(nsDb2, "ns-scope").length === 1, "normal Stop: gates preserved");
+assert(gatesDb.getActiveGate(nsDb2, "ns-scope").status === "active", "normal Stop: gate still active");
+nsDb2.close();
+
+fs.rmSync(tmpNormalStop, { recursive: true, force: true });
 
 // ── hooks.json wiring: new gates ─────────────────────────────────────
 

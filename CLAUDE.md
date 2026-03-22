@@ -36,7 +36,7 @@ Declarative pipeline gates — `verification:`, `conditions:`, and `gates:` fiel
 - `commit-gate.js` — PreToolUse:Bash. Detects `git commit`, runs configured validation commands. Opt-in via `claude-gates.json`.
 - `edit-gate.js` — PostToolUse:Edit|Write. Tracks edited files + runs opt-in formatter commands (deduped per file). Config: `edit_gate.commands`.
 - `gate-block.js` — PreToolUse (no matcher = all tools). Blocks non-read tools when gate is active/revise/fix. Allows Read/Glob/Grep and spawning correct agent.
-- `stop-gate.js` — Stop + StopFailure. On normal Stop: artifact completeness + configurable debug scan + custom commands + commit nudge. On StopFailure (API error): resets orphaned active/revise/fix gates to pending for recovery. Default mode: warn (stderr only).
+- `stop-gate.js` — Stop + StopFailure. On normal Stop: artifact completeness + configurable debug scan + custom commands + commit nudge. On StopFailure (API error): deletes orphaned gate rows so `initGates` can recreate fresh on retry. Default mode: warn (stderr only).
 
 ## Testing
 

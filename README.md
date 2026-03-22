@@ -68,7 +68,7 @@ All gates are **fail-open** — if something breaks, your work continues unblock
 | **Plan** | `PreToolUse:ExitPlanMode` | Blocks unreviewed plans (>20 lines) until gater returns PASS. Auto-allows after 3 attempts |
 | **Commit** | `PreToolUse:Bash` | Runs configured commands before `git commit`. Disabled by default |
 | **Edit** | `PostToolUse:Edit\|Write` | Tracks edited files, runs opt-in formatters (deduped per file). Non-blocking |
-| **Stop** | `Stop` + `StopFailure` | Scans edited files for debug patterns (`TODO`, `console.log`). Nudges uncommitted changes. On API errors, resets orphaned gates for recovery |
+| **Stop** | `Stop` + `StopFailure` | Scans edited files for debug patterns (`TODO`, `console.log`). Nudges uncommitted changes. On API errors, clears orphaned gates so pipeline can retry cleanly |
 
 ### Agent frontmatter fields
 

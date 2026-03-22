@@ -32,16 +32,21 @@ try {
   // SQLite state
   const db = getDb(sessionDir);
 
-  // ── StopFailure: reset orphaned gates so next turn isn't blocked ──
+  // ── StopFailure: delete orphaned gates so initGates can recreate on retry ──
   if (data.error) {
     try {
-      const reset = db.prepare(
-        "UPDATE gates SET status = 'pending', round = 0 WHERE status IN ('active','revise','fix')"
-      );
-      const result = reset.run();
-      if (result.changes > 0) {
+      // Delete (not reset) — initGates is a no-op when rows exist, so resetting
+      // to 'pending' would leave a stuck chain with no active gate. Deleting lets
+      // initGates recreate fresh with the first gate active on the next run.
+      const scopes = db.prepare(
+        "SELECT DISTINCT scope FROM gates WHERE status IN ('active','revise','fix')"
+      ).all().map(r => r.scope);
+      if (scopes.length > 0) {
+        const del = db.prepare("DELETE FROM gates WHERE scope = ?");
+        const tx = db.transaction(() => { for (const s of scopes) del.run(s); });
+        tx();
         process.stderr.write(
-          `[ClaudeGates] API error (${data.error}): ${result.changes} active gate(s) reset to pending.\n`
+          `[ClaudeGates] API error (${data.error}): cleared gates for ${scopes.length} scope(s) — will reinitialize on retry.\n`
         );
       }
     } catch {}

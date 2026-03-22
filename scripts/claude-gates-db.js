@@ -45,17 +45,25 @@ try {
 } catch {
   // Installed node_modules live in CLAUDE_PLUGIN_DATA (survives plugin updates).
   const dataDir = process.env.CLAUDE_PLUGIN_DATA;
+  let loadError;
   if (dataDir) {
     try {
       Database = require(path.join(dataDir, "node_modules", "better-sqlite3"));
-    } catch {}
+    } catch (e) {
+      loadError = e;
+    }
   }
   if (!Database) {
     const pluginDir = __dirname.replace(/[\\/]scripts$/, "");
+    const isAbiMismatch = loadError && /NODE_MODULE_VERSION|was compiled against/.test(loadError.message);
+    const hint = isAbiMismatch
+      ? "ABI mismatch — rebuild with: cd \"" + dataDir + "\" && npm rebuild better-sqlite3"
+      : "Run \"npm install\" in the plugin data directory.";
     process.stderr.write(
-      `[ClaudeGates] FATAL: better-sqlite3 not found. Run "npm install" in the plugin data directory.\n` +
+      `[ClaudeGates] FATAL: better-sqlite3 failed to load. ${hint}\n` +
       `  Plugin path: ${pluginDir}\n` +
-      `  Data dir: ${dataDir || "(CLAUDE_PLUGIN_DATA not set)"}\n`
+      `  Data dir: ${dataDir || "(CLAUDE_PLUGIN_DATA not set)"}\n` +
+      (loadError ? `  Error: ${loadError.message}\n` : "")
     );
     throw new Error("better-sqlite3 not found");
   }
