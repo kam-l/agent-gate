@@ -405,20 +405,30 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
   }
 
   // ── Verdict precedence ──
-  // 1. Semantic checker FAIL → hard block (quality gate)
-  // 2. Else → use artifact's Result: line as authoritative verdict
-  // 3. No match → UNKNOWN, allow (fail-open)
+  // For source agents: semantic FAIL overrides artifact verdict (quality gate)
+  // For gate agents: artifact Result: line is authoritative (gate IS the authority)
+  //   Semantic FAIL on gate agents = advisory warning, not override.
+  //   Overriding creates unrecoverable deadlock: SubagentStop can't enforce blocks,
+  //   so agent completes, gate stays active, orchestrator moves on, pipeline freezes.
 
   let finalVerdict = "UNKNOWN";
+  const artifactVerdictMatch = VERDICT_RE.exec(artifactContent);
 
-  if (semanticMatch && semanticMatch[1].toUpperCase() === "FAIL") {
+  // Check if this agent is a gate agent (has active gate row in DB)
+  const isGateAgent = db && scope && db.prepare(
+    "SELECT 1 FROM gates WHERE gate_agent = ? AND scope = ? AND status = 'active' LIMIT 1"
+  ).get(agentType.includes(":") ? agentType.split(":").pop() : agentType, scope);
+
+  if (semanticMatch && semanticMatch[1].toUpperCase() === "FAIL" && !isGateAgent) {
+    // Source agent: semantic FAIL overrides
     finalVerdict = "FAIL";
+  } else if (semanticMatch && semanticMatch[1].toUpperCase() === "FAIL" && isGateAgent) {
+    // Gate agent: log warning, use artifact verdict
+    process.stderr.write(`[ClaudeGates] Semantic check FAIL for gate agent ${agentType} (advisory only): ${semanticMatch[2] || "format issue"}\n`);
+    finalVerdict = artifactVerdictMatch ? artifactVerdictMatch[1].toUpperCase() : "UNKNOWN";
   } else {
     // Use artifact's own Result: line
-    const artifactVerdictMatch = VERDICT_RE.exec(artifactContent);
-    if (artifactVerdictMatch) {
-      finalVerdict = artifactVerdictMatch[1].toUpperCase();
-    }
+    finalVerdict = artifactVerdictMatch ? artifactVerdictMatch[1].toUpperCase() : "UNKNOWN";
   }
 
   // Record verdict
