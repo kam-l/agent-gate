@@ -449,10 +449,12 @@ function runSemanticCheck(prompt, artifactContent, artifactPath, contextContent,
   // FAIL leaves gate rows as 'active' permanently, blocking all subsequent work.
   processGateTransitions(db, scope, agentType, finalVerdict, mdContent);
 
-  // FAIL: attempt to block (may not work at SubagentStop, but try)
+  // FAIL: exit 2 + stderr → orchestrator sees the reason and can re-spawn/resume.
+  // stdout block doesn't work at SubagentStop; exit 2 feeds stderr to the parent.
   if (finalVerdict === "FAIL") {
     const reason = semanticMatch && semanticMatch[2] ? semanticMatch[2].trim() : "Semantic validation failed";
-    block(`Your ${path.basename(artifactPath)} failed semantic validation: ${reason}. Rewrite it with substantive content.`);
+    process.stderr.write(`[ClaudeGates] FAIL: ${path.basename(artifactPath)} — ${reason}. Resume or re-spawn ${agentType} with scope=${scope} to fix.\n`);
+    process.exit(2);
   }
 }
 

@@ -18,7 +18,7 @@ const fs = require("fs");
 const path = require("path");
 const { getDb } = require("./claude-gates-db.js");
 
-const ALLOWED_TOOLS = ["Read", "Glob", "Grep", "TaskCreate", "TaskUpdate"];
+const ALLOWED_TOOLS = ["Read", "Glob", "Grep", "TaskCreate", "TaskUpdate", "SendMessage"];
 
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf-8"));
