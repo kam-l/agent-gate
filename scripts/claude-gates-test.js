@@ -768,6 +768,41 @@ assert(deletedResult.exitCode === 0 && !deletedResult.stdout.includes("block"), 
 fs.rmSync(tmpStopSession, { recursive: true, force: true });
 fs.rmSync(deletedStopSession, { recursive: true, force: true });
 
+// ── StopFailure: gate reset on API error ─────────────────────────────
+
+describe("StopFailure: resets active gates to pending");
+
+const tmpFailSession = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-stopfail-"));
+const failSessionDir = path.join(tmpFailSession, ".claude", "sessions", "stop-fail");
+fs.mkdirSync(failSessionDir, { recursive: true });
+
+// Set up a gate in 'active' state
+const failDb = gatesDb.getDb(failSessionDir);
+gatesDb.registerAgent(failDb, "test-scope", "test-worker", null);
+gatesDb.initGates(failDb, "test-scope", "test-worker", [
+  { agent: "gt-reviewer", maxRounds: 3, fixer: null }
+]);
+const activeGate = gatesDb.getActiveGate(failDb, "test-scope");
+assert(activeGate && activeGate.status === "active", "gate starts active");
+failDb.close();
+
+// Send StopFailure payload (has error field)
+const stopFailResult = runStopGate(
+  { session_id: "stop-fail", error: "rate_limit", error_details: "429 Too Many Requests" },
+  { USERPROFILE: tmpFailSession, HOME: tmpFailSession }
+);
+assert(stopFailResult.exitCode === 0, "StopFailure exits 0");
+
+// Verify gate was reset to pending
+const failDb2 = gatesDb.getDb(failSessionDir);
+const resetGate = gatesDb.getActiveGate(failDb2, "test-scope");
+assert(!resetGate, "StopFailure: no active gate after reset");
+const allGates = gatesDb.getGates(failDb2, "test-scope");
+assert(allGates.length === 1 && allGates[0].status === "pending", "StopFailure: gate reset to pending");
+failDb2.close();
+
+fs.rmSync(tmpFailSession, { recursive: true, force: true });
+
 // ── hooks.json wiring: new gates ─────────────────────────────────────
 
 describe("hooks.json wiring: new gates");
@@ -795,6 +830,12 @@ const stopHooks = hooksJson.hooks.Stop || [];
 assert(
   stopHooks.length > 0 && stopHooks[0].hooks.some(h => h.command.includes("stop-gate")),
   "Stop stop-gate wired"
+);
+
+const stopFailureHooks = hooksJson.hooks.StopFailure || [];
+assert(
+  stopFailureHooks.length > 0 && stopFailureHooks[0].hooks.some(h => h.command.includes("stop-gate")),
+  "StopFailure stop-gate wired"
 );
 
 // Verify all hooks use ${CLAUDE_PLUGIN_ROOT} or ${CLAUDE_PLUGIN_DATA}

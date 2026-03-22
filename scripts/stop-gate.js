@@ -29,8 +29,26 @@ try {
   const HOME = process.env.USERPROFILE || process.env.HOME || "";
   const sessionDir = path.join(HOME, ".claude", "sessions", sessionId);
 
-  // SQLite: completeness check + debug scan
+  // SQLite state
   const db = getDb(sessionDir);
+
+  // ── StopFailure: reset orphaned gates so next turn isn't blocked ──
+  if (data.error) {
+    try {
+      const reset = db.prepare(
+        "UPDATE gates SET status = 'pending', round = 0 WHERE status IN ('active','revise','fix')"
+      );
+      const result = reset.run();
+      if (result.changes > 0) {
+        process.stderr.write(
+          `[ClaudeGates] API error (${data.error}): ${result.changes} active gate(s) reset to pending.\n`
+        );
+      }
+    } catch {}
+    db.close();
+    process.exit(0);
+  }
+
   let files;
   const issues = [];
 

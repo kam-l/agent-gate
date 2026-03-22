@@ -4,7 +4,7 @@ Declarative pipeline gates — `verification:`, `conditions:`, and `gates:` fiel
 
 ## Key Invariants
 
-- Hooks in `hooks/hooks.json` use `${CLAUDE_PLUGIN_ROOT}/scripts/...` paths
+- Hooks in `hooks/hooks.json` use `${CLAUDE_PLUGIN_ROOT}/scripts/...` paths (except SessionStart which also uses `${CLAUDE_PLUGIN_DATA}`)
 - Gate logic: conditions check → injection → verification. All three scripts must stay in sync.
 - Keep `<agent_gate>` XML tag unchanged — backward compat with existing agent definitions.
 - `gates:` field requires SQLite (`better-sqlite3`). It is a hard dependency — install must succeed.
@@ -12,7 +12,7 @@ Declarative pipeline gates — `verification:`, `conditions:`, and `gates:` fiel
 
 ## Session State
 
-- All hooks require SQLite via `better-sqlite3` (hard dependency, no JSON fallback).
+- All hooks require SQLite via `better-sqlite3` (hard dependency, no JSON fallback). Installed into `CLAUDE_PLUGIN_DATA` via SessionStart hook (persists across plugin updates).
 - DB module: `scripts/claude-gates-db.js`. Column names match JS property names (`max`, `outputFilepath`).
 - Migration: first `getDb()` call auto-imports existing JSON files into SQLite inside a transaction. Old files left in place (marker prevents re-migration).
 - Tables: `agents`, `gates`, `edits`, `tool_history`.
@@ -36,12 +36,12 @@ Declarative pipeline gates — `verification:`, `conditions:`, and `gates:` fiel
 - `commit-gate.js` — PreToolUse:Bash. Detects `git commit`, runs configured validation commands. Opt-in via `claude-gates.json`.
 - `edit-gate.js` — PostToolUse:Edit|Write. Tracks edited files + runs opt-in formatter commands (deduped per file). Config: `edit_gate.commands`.
 - `gate-block.js` — PreToolUse (no matcher = all tools). Blocks non-read tools when gate is active/revise/fix. Allows Read/Glob/Grep and spawning correct agent.
-- `stop-gate.js` — Stop. Artifact completeness + configurable debug scan + custom commands + commit nudge. Default mode: warn (stderr only).
+- `stop-gate.js` — Stop + StopFailure. On normal Stop: artifact completeness + configurable debug scan + custom commands + commit nudge. On StopFailure (API error): resets orphaned active/revise/fix gates to pending for recovery. Default mode: warn (stderr only).
 
 ## Testing
 
 ```bash
-node scripts/claude-gates-test.js    # 280+ tests (SQLite)
+node scripts/claude-gates-test.js    # 300+ tests (SQLite)
 ```
 
 Tests are subprocess-based with temp dirs. Each test creates its own session directory and cleans up with `rmSync`.
