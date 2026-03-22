@@ -797,18 +797,18 @@ assert(
   "Stop stop-gate wired"
 );
 
-// Verify all hooks use ${CLAUDE_PLUGIN_ROOT}
-let allUsePluginRoot = true;
+// Verify all hooks use ${CLAUDE_PLUGIN_ROOT} or ${CLAUDE_PLUGIN_DATA}
+let allUsePluginVars = true;
 for (const [event, entries] of Object.entries(hooksJson.hooks)) {
   for (const entry of entries) {
     for (const hook of entry.hooks || []) {
-      if (hook.command && !hook.command.includes("${CLAUDE_PLUGIN_ROOT}")) {
-        allUsePluginRoot = false;
+      if (hook.command && !hook.command.includes("${CLAUDE_PLUGIN_ROOT}") && !hook.command.includes("${CLAUDE_PLUGIN_DATA}")) {
+        allUsePluginVars = false;
       }
     }
   }
 }
-assert(allUsePluginRoot, "all hooks use ${CLAUDE_PLUGIN_ROOT}");
+assert(allUsePluginVars, "all hooks use ${CLAUDE_PLUGIN_ROOT} or ${CLAUDE_PLUGIN_DATA}");
 
 // ── SQLite DB module tests ─────────────────────────────────────────
 

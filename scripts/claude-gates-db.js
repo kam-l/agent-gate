@@ -43,26 +43,19 @@ let Database;
 try {
   Database = require("better-sqlite3");
 } catch {
-  // Local node_modules missing — try sibling version directories.
-  // Plugin cache layout: .../claude-gates/<version>/node_modules/
-  const pluginDir = __dirname.replace(/[\\/]scripts$/, "");
-  const parentDir = path.dirname(pluginDir);
-  let found = false;
-  try {
-    for (const sibling of fs.readdirSync(parentDir)) {
-      if (sibling === path.basename(pluginDir)) continue;
-      const candidate = path.join(parentDir, sibling, "node_modules", "better-sqlite3");
-      try {
-        Database = require(candidate);
-        found = true;
-        break;
-      } catch {}
-    }
-  } catch {}
-  if (!found) {
+  // Installed node_modules live in CLAUDE_PLUGIN_DATA (survives plugin updates).
+  const dataDir = process.env.CLAUDE_PLUGIN_DATA;
+  if (dataDir) {
+    try {
+      Database = require(path.join(dataDir, "node_modules", "better-sqlite3"));
+    } catch {}
+  }
+  if (!Database) {
+    const pluginDir = __dirname.replace(/[\\/]scripts$/, "");
     process.stderr.write(
-      `[ClaudeGates] FATAL: better-sqlite3 not found. Run "npm install" in the plugin directory.\n` +
-      `  Plugin path: ${pluginDir}\n`
+      `[ClaudeGates] FATAL: better-sqlite3 not found. Run "npm install" in the plugin data directory.\n` +
+      `  Plugin path: ${pluginDir}\n` +
+      `  Data dir: ${dataDir || "(CLAUDE_PLUGIN_DATA not set)"}\n`
     );
     throw new Error("better-sqlite3 not found");
   }

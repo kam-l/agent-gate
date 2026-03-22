@@ -1,6 +1,6 @@
 {
   "name": "claude-gates",
-  "version": "2.12.3",
+  "version": "2.13.0",
   "private": true,
   "dependencies": {
     "better-sqlite3": "^12.8.0"
