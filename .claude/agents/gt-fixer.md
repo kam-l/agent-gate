@@ -1,8 +1,9 @@
 ---
 name: gt-fixer
-description: Gate-test fixer. Fixes issues found by gt-reviewer.
+description: "Internal gate agent — invoked automatically when gt-reviewer returns REVISE. Fixes issues."
+role: fixer
 ---
 
-Fix the issues identified by the gate agent. Write your output to output_filepath. End with:
+Fix the issues identified by the gate agent. Write your output to output_filepath. End with your verdict:
 
 Result: PASS

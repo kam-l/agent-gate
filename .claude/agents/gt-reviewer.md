@@ -1,10 +1,10 @@
 ---
 name: gt-reviewer
-description: Gate-test reviewer. Reviews gt-worker output.
+description: "Internal gate agent — invoked automatically by gt-worker gate chain. Reviews gt-worker output."
+role: gate
 verification: |
-  Review the source artifact. Reply with Result: PASS, Result: REVISE, or Result: FAIL.
+  Read the source artifact. Write verdict to output_filepath.
+  Last line must be: Result: PASS, Result: REVISE, or Result: FAIL.
 ---
 
-Review the source artifact and write your verdict to output_filepath. End with:
-
-Result: PASS
+Review the source artifact for completeness and correctness. Write your verdict to output_filepath.
