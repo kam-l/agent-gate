@@ -2510,6 +2510,126 @@ if (e2eDb) {
     "E2E step 11: hasActiveGates is false");
 
   db2.close();
+
+  // ── E2E: bare gate agent (no verification:/gates: in its own .md) ──
+  describe("E2E: bare gate agent transitions");
+
+  const tmpBare = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-bare-"));
+  const bareSessionDir = path.join(tmpBare, ".claude", "sessions", "bare-test");
+  fs.mkdirSync(bareSessionDir, { recursive: true });
+  const bareEnv = { USERPROFILE: tmpBare, HOME: tmpBare };
+
+  // Create source agent with gates pointing to a bare reviewer
+  const bareAgentsDir = path.join(tmpBare, ".claude", "agents");
+  fs.mkdirSync(bareAgentsDir, { recursive: true });
+  fs.writeFileSync(path.join(bareAgentsDir, "bare-source.md"),
+    "---\nname: bare-source\ngates:\n  - [bare-reviewer, 2]\n---\nDo work.\n", "utf-8");
+  // bare-reviewer has NO verification: or gates: — just a plain agent
+  fs.writeFileSync(path.join(bareAgentsDir, "bare-reviewer.md"),
+    "---\nname: bare-reviewer\ndescription: A reviewer with no verification or gates fields\n---\nReview the work.\n", "utf-8");
+
+  const bareDb = gatesDb.getDb(bareSessionDir);
+
+  // Register source agent scope (conditions hook)
+  runHook(condScript, {
+    session_id: "bare-test", tool_name: "Agent",
+    tool_input: { subagent_type: "bare-source", prompt: "scope=bare-scope build something" }
+  }, bareEnv);
+
+  // Source completes with PASS → gates initialized
+  const bareScopeDir = path.join(bareSessionDir, "bare-scope");
+  fs.mkdirSync(bareScopeDir, { recursive: true });
+  fs.writeFileSync(path.join(bareScopeDir, "bare-source.md"), "Did the work.\n\nResult: PASS\n", "utf-8");
+
+  const verBareSource = runHook(verScript, {
+    session_id: "bare-test",
+    agent_type: "bare-source",
+    agent_id: "bs1",
+    last_assistant_message: "Done. Result: PASS"
+  }, bareEnv, 15000);
+  assert(verBareSource.exitCode === 0, "Bare gate: source verification exits 0");
+
+  const bareGates = gatesDb.getGates(bareDb, "bare-scope");
+  assert(bareGates.length === 1, "Bare gate: 1 gate initialized");
+  assert(bareGates[0].gate_agent === "bare-reviewer", "Bare gate: gate agent is bare-reviewer");
+  assert(bareGates[0].status === "active", "Bare gate: gate is active");
+
+  // bare-reviewer completes with PASS — this is the bug case
+  // Gate agent has NO verification: or gates: in its own .md
+  const verBareReviewer = runHook(verScript, {
+    session_id: "bare-test",
+    agent_type: "bare-reviewer",
+    agent_id: "br1",
+    last_assistant_message: "Looks good.\nResult: PASS"
+  }, bareEnv, 15000);
+  assert(verBareReviewer.exitCode === 0, "Bare gate: reviewer verification exits 0");
+
+  const bareGatesAfter = gatesDb.getGates(bareDb, "bare-scope");
+  assert(bareGatesAfter[0].status === "passed",
+    "Bare gate: gate transitions to passed (no verification/gates in reviewer.md)");
+  assert(!gatesDb.hasActiveGates(bareDb, "bare-scope"),
+    "Bare gate: no active gates after pass");
+
+  // Verify gate-block unblocks
+  const bareUnblock = runGateBlock({
+    session_id: "bare-test",
+    tool_name: "Bash",
+    tool_input: { command: "echo free" }
+  }, bareEnv);
+  assert(!bareUnblock.stdout.includes("block"),
+    "Bare gate: tools unblocked after bare reviewer passes");
+
+  bareDb.close();
+  fs.rmSync(tmpBare, { recursive: true, force: true });
+
+  // ── E2E: bare gate agent REVISE triggers source revision ──
+  describe("E2E: bare gate agent REVISE");
+
+  const tmpBareR = fs.mkdtempSync(path.join(os.tmpdir(), "cgates-bare-rev-"));
+  const bareRSessionDir = path.join(tmpBareR, ".claude", "sessions", "bare-rev-test");
+  fs.mkdirSync(bareRSessionDir, { recursive: true });
+  const bareREnv = { USERPROFILE: tmpBareR, HOME: tmpBareR };
+
+  const bareRAgentsDir = path.join(tmpBareR, ".claude", "agents");
+  fs.mkdirSync(bareRAgentsDir, { recursive: true });
+  fs.writeFileSync(path.join(bareRAgentsDir, "bare-source.md"),
+    "---\nname: bare-source\ngates:\n  - [bare-reviewer, 2]\n---\nDo work.\n", "utf-8");
+  fs.writeFileSync(path.join(bareRAgentsDir, "bare-reviewer.md"),
+    "---\nname: bare-reviewer\n---\nReview.\n", "utf-8");
+
+  const bareRDb = gatesDb.getDb(bareRSessionDir);
+
+  // Register source scope
+  runHook(condScript, {
+    session_id: "bare-rev-test", tool_name: "Agent",
+    tool_input: { subagent_type: "bare-source", prompt: "scope=rev-scope do work" }
+  }, bareREnv);
+
+  const bareRScopeDir = path.join(bareRSessionDir, "rev-scope");
+  fs.mkdirSync(bareRScopeDir, { recursive: true });
+  fs.writeFileSync(path.join(bareRScopeDir, "bare-source.md"), "Did it.\n\nResult: PASS\n", "utf-8");
+
+  runHook(verScript, {
+    session_id: "bare-rev-test", agent_type: "bare-source", agent_id: "bs2",
+    last_assistant_message: "Done. Result: PASS"
+  }, bareREnv, 15000);
+
+  // bare-reviewer returns REVISE
+  const verBareRevise = runHook(verScript, {
+    session_id: "bare-rev-test", agent_type: "bare-reviewer", agent_id: "br2",
+    last_assistant_message: "Needs work.\nResult: REVISE"
+  }, bareREnv, 15000);
+  assert(verBareRevise.exitCode === 0, "Bare REVISE: reviewer verification exits 0");
+
+  const bareRGates = gatesDb.getGates(bareRDb, "rev-scope");
+  assert(bareRGates[0].status === "revise",
+    "Bare REVISE: gate transitions to revise");
+  assert(bareRGates[0].round === 1,
+    "Bare REVISE: round incremented");
+
+  bareRDb.close();
+  fs.rmSync(tmpBareR, { recursive: true, force: true });
+
 } else {
   console.log("  SKIP: E2E gate lifecycle — better-sqlite3 not available");
 }

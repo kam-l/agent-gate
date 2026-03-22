@@ -124,6 +124,15 @@ try {
         processGateTransitions(db0, revRow.scope, bareAgentType, finalVerdict, mdContent);
         process.exit(0);
       }
+      // Check if this agent is a gate agent completing its review
+      const gateRow = targetScope0
+        ? db0.prepare("SELECT scope FROM gates WHERE gate_agent = ? AND status = 'active' AND scope = ? LIMIT 1").get(bareAgentType, targetScope0)
+        : db0.prepare("SELECT scope FROM gates WHERE gate_agent = ? AND status = 'active' LIMIT 1").get(bareAgentType);
+      if (gateRow) {
+        const finalVerdict = extractVerdict(lastMessage);
+        processGateTransitions(db0, gateRow.scope, bareAgentType, finalVerdict, mdContent);
+        process.exit(0);
+      }
     } finally {
       db0.close();
     }
